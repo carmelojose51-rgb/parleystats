@@ -25,6 +25,20 @@ class Handler(SimpleHTTPRequestHandler):
                 # usamos los últimos partidos terminados de ambos equipos.
                 hist={'status':'FINISHED','limit':10}
                 hm=api('/teams/%s/matches'%home,hist); am=api('/teams/%s/matches'%away,hist)
+                history_season=None
+                # Si la temporada actual aún no comenzó, usamos la anterior
+                # para no fabricar estadísticas con valores de relleno.
+                if not hm.get('matches') or not am.get('matches'):
+                    try:
+                        fallback_year=(int(target[:4])-1) if target else (date.today().year-1)
+                        previous={'season':fallback_year,'status':'FINISHED','limit':10}
+                        old_hm=api('/teams/%s/matches'%home,previous)
+                        old_am=api('/teams/%s/matches'%away,previous)
+                        if old_hm.get('matches') and old_am.get('matches'):
+                            hm,am=old_hm,old_am
+                            history_season=fallback_year
+                    except (ValueError, TypeError):
+                        pass
                 fixture=None
                 if target:
                     try:
@@ -42,10 +56,13 @@ class Handler(SimpleHTTPRequestHandler):
                         if hg is None or ag is None: continue
                         n+=1; ish=m.get('homeTeam',{}).get('id')==team; gf+=hg if ish else ag; ga+=ag if ish else hg; pts+=3 if (hg>ag if ish else ag>hg) else 1 if hg==ag else 0
                     return {'matches':n,'gf':gf/n if n else 1.2,'ga':ga/n if n else 1.2}
-                hs,avs=stats(hm,home),stats(am,away); lx=max(.15,(hs['gf']+avs['ga'])/2); ax=max(.15,(avs['gf']+hs['ga'])/2)
+                hs,avs=stats(hm,home),stats(am,away)
+                if hs['matches']==0 or avs['matches']==0:
+                    self.send_json({'homeMatches':hm.get('matches',[]),'awayMatches':am.get('matches',[]),'engine':{'sampleSize':hs['matches']+avs['matches'],'dataAvailable':False,'historySeason':history_season,'date':target,'fixture':fixture,'historySeason':history_season,'method':'Poisson sobre promedios recientes'}}); return
+                lx=max(.15,(hs['gf']+avs['ga'])/2); ax=max(.15,(avs['gf']+hs['ga'])/2)
                 def pois(l,k): return math.exp(-l)*l**k/math.factorial(k)
                 probs={(i,j):pois(lx,i)*pois(ax,j) for i in range(8) for j in range(8)}; total=sum(probs.values()); hp=sum(v for (i,j),v in probs.items() if i>j)/total; dp=sum(v for (i,j),v in probs.items() if i==j)/total; ap=sum(v for (i,j),v in probs.items() if i<j)/total; o15=1-sum(v for (i,j),v in probs.items() if i+j<=1)/total; btts=sum(v for (i,j),v in probs.items() if i>0 and j>0)/total; ex=max(probs,key=probs.get)
-                self.send_json({'homeMatches':hm.get('matches',[]),'awayMatches':am.get('matches',[]),'engine':{'sampleSize':hs['matches']+avs['matches'],'probabilities':{'home':round(hp*100,1),'draw':round(dp*100,1),'away':round(ap*100,1),'over1_5':round(o15*100,1),'btts':round(btts*100,1)},'expectedGoals':{'home':round(lx,2),'away':round(ax,2)},'mostLikelyScore':f'{ex[0]}-{ex[1]}','date':target,'fixture':fixture,'method':'Poisson sobre promedios recientes'}}); return
+                self.send_json({'homeMatches':hm.get('matches',[]),'awayMatches':am.get('matches',[]),'engine':{'sampleSize':hs['matches']+avs['matches'],'probabilities':{'home':round(hp*100,1),'draw':round(dp*100,1),'away':round(ap*100,1),'over1_5':round(o15*100,1),'btts':round(btts*100,1)},'expectedGoals':{'home':round(lx,2),'away':round(ax,2)},'mostLikelyScore':f'{ex[0]}-{ex[1]}','date':target,'fixture':fixture,'historySeason':history_season,'method':'Poisson sobre promedios recientes'}}); return
             return SimpleHTTPRequestHandler.do_GET(self)
         except Exception as e: self.send_json({'error':'No se pudo consultar Football-Data.org','detail':str(e)},502)
 if __name__=='__main__':
