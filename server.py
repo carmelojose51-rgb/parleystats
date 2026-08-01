@@ -18,7 +18,9 @@ class Handler(SimpleHTTPRequestHandler):
             if p.path=='/api/teams': self.send_json(api('/competitions/%s/teams'%q['competition'][0])); return
             if p.path=='/api/matches': self.send_json(api('/matches',{'status':'LIVE'})); return
             if p.path=='/api/analyze':
-                home=int(q['home'][0]); away=int(q['away'][0]); hm=api('/teams/%s/matches'%home,{'status':'FINISHED','limit':10}); am=api('/teams/%s/matches'%away,{'status':'FINISHED','limit':10})
+                home=int(q['home'][0]); away=int(q['away'][0]); target=q.get('date',[None])[0]; hist={'status':'FINISHED','limit':10};
+                if target: hist['dateTo']=target
+                hm=api('/teams/%s/matches'%home,hist); am=api('/teams/%s/matches'%away,hist)
                 def stats(data,team):
                     gf=ga=pts=n=0
                     for m in data.get('matches',[]):
@@ -29,7 +31,7 @@ class Handler(SimpleHTTPRequestHandler):
                 hs,avs=stats(hm,home),stats(am,away); lx=max(.15,(hs['gf']+avs['ga'])/2); ax=max(.15,(avs['gf']+hs['ga'])/2)
                 def pois(l,k): return math.exp(-l)*l**k/math.factorial(k)
                 probs={(i,j):pois(lx,i)*pois(ax,j) for i in range(8) for j in range(8)}; total=sum(probs.values()); hp=sum(v for (i,j),v in probs.items() if i>j)/total; dp=sum(v for (i,j),v in probs.items() if i==j)/total; ap=sum(v for (i,j),v in probs.items() if i<j)/total; o15=1-sum(v for (i,j),v in probs.items() if i+j<=1)/total; btts=sum(v for (i,j),v in probs.items() if i>0 and j>0)/total; ex=max(probs,key=probs.get)
-                self.send_json({'homeMatches':hm.get('matches',[]),'awayMatches':am.get('matches',[]),'engine':{'sampleSize':hs['matches']+avs['matches'],'probabilities':{'home':round(hp*100,1),'draw':round(dp*100,1),'away':round(ap*100,1),'over1_5':round(o15*100,1),'btts':round(btts*100,1)},'expectedGoals':{'home':round(lx,2),'away':round(ax,2)},'mostLikelyScore':f'{ex[0]}-{ex[1]}','method':'Poisson sobre promedios recientes'}}); return
+                self.send_json({'homeMatches':hm.get('matches',[]),'awayMatches':am.get('matches',[]),'engine':{'sampleSize':hs['matches']+avs['matches'],'probabilities':{'home':round(hp*100,1),'draw':round(dp*100,1),'away':round(ap*100,1),'over1_5':round(o15*100,1),'btts':round(btts*100,1)},'expectedGoals':{'home':round(lx,2),'away':round(ax,2)},'mostLikelyScore':f'{ex[0]}-{ex[1]}','date':target,'method':'Poisson sobre promedios recientes'}}); return
             return SimpleHTTPRequestHandler.do_GET(self)
         except Exception as e: self.send_json({'error':'No se pudo consultar Football-Data.org','detail':str(e)},502)
 if __name__=='__main__':
