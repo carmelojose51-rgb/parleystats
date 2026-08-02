@@ -3,12 +3,75 @@ import json, os, math, urllib.parse, urllib.request
 from datetime import date, timedelta
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 TOKEN = os.environ.get('FOOTBALL_DATA_API_TOKEN')
+API_FOOTBALL_KEY = os.environ.get('API_FOOTBALL_KEY')
 BASE = 'https://api.football-data.org/v4'
+AF_BASE = 'https://v3.football.api-sports.io'
 def api(path, params=None):
     url=BASE+path
     if params: url+='?'+urllib.parse.urlencode(params)
     req=urllib.request.Request(url, headers={'X-Auth-Token':TOKEN or ''})
     with urllib.request.urlopen(req,timeout=20) as r: return json.load(r)
+def af_api(path, params=None):
+    url=AF_BASE+path
+    if params: url+='?'+urllib.parse.urlencode(params)
+    req=urllib.request.Request(url, headers={'x-apisports-key':API_FOOTBALL_KEY or ''})
+    with urllib.request.urlopen(req,timeout=20) as r: return json.load(r)
+AF_CACHE={}
+def af_team_id(name):
+    key=('team',name)
+    if key in AF_CACHE: return AF_CACHE[key]
+    try:
+        clean=name.replace(' FBPA','').replace(' FC','')
+        data=af_api('/teams',{'search':clean})
+        rows=data.get('response',[])
+        tid=rows[0].get('team',{}).get('id') if rows else None
+        AF_CACHE[key]=tid
+        return tid
+    except Exception:
+        return None
+def af_team_average(name):
+    """Promedio real de córners y tarjetas en los 5 partidos más recientes
+    disponibles en API-Football (la cuenta gratuita permite temporadas pasadas)."""
+    key=('avg',name)
+    if key in AF_CACHE: return AF_CACHE[key]
+    tid=af_team_id(name)
+    if not tid: return None
+    try:
+        rows=af_api('/fixtures',{'team':tid,'season':2024}).get('response',[])
+        rows=sorted([x for x in rows if x.get('fixture',{}).get('status',{}).get('short') in ('FT','AET','PEN')], key=lambda x:x.get('fixture',{}).get('date',''), reverse=True)[:5]
+        totals=[]
+        for row in rows:
+            fid=row.get('fixture',{}).get('id')
+            data=af_api('/fixtures/statistics',{'fixture':fid})
+            corners=cards=0; has_corners=False; has_cards=False
+            for team in data.get('response',[]):
+                for item in team.get('statistics',[]):
+                    typ=item.get('type'); val=item.get('value')
+                    if isinstance(val,str):
+                        try: val=float(val.replace('%',''))
+                        except ValueError: val=None
+                    if typ=='Corner Kicks' and isinstance(val,(int,float)):
+                        corners+=val; has_corners=True
+                    if typ in ('Yellow Cards','Red Cards') and isinstance(val,(int,float)):
+                        cards+=val; has_cards=True
+            if has_corners or has_cards: totals.append((corners if has_corners else None,cards if has_cards else None))
+        if not totals: return None
+        c=[x[0] for x in totals if x[0] is not None]; k=[x[1] for x in totals if x[1] is not None]
+        result={'corners':round(sum(c)/len(c),1) if c else None,'cards':round(sum(k)/len(k),1) if k else None,'source':'API-Football · promedio 5 partidos'}
+        AF_CACHE[key]=result
+        return result
+    except Exception:
+        return None
+def af_match_stats(home_name, away_name):
+    h=af_team_average(home_name); a=af_team_average(away_name)
+    if not h and not a: return None
+    vals={}
+    for field in ('corners','cards'):
+        nums=[x[field] for x in (h,a) if x and x.get(field) is not None]
+        if nums: vals[field]=round(sum(nums)/len(nums),1)
+    vals['source']='API-Football · promedio histórico'
+    return vals if len(vals)>1 else None
+
 class Handler(SimpleHTTPRequestHandler):
     def send_json(self,data,status=200):
         raw=json.dumps(data,ensure_ascii=False).encode(); self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8'); self.send_header('Content-Length',str(len(raw))); self.send_header('Access-Control-Allow-Origin','*'); self.end_headers(); self.wfile.write(raw)
@@ -19,7 +82,7 @@ class Handler(SimpleHTTPRequestHandler):
             if p.path=='/api/teams': self.send_json(api('/competitions/%s/teams'%q['competition'][0])); return
             if p.path=='/api/matches': self.send_json(api('/matches',{'status':'LIVE'})); return
             if p.path=='/api/analyze':
-                home=int(q['home'][0]); away=int(q['away'][0]); target=q.get('date',[None])[0]
+                home=int(q['home'][0]); away=int(q['away'][0]); target=q.get('date',[None])[0]; home_name=q.get('homeName',[''])[0]; away_name=q.get('awayName',[''])[0]
                 # La fecha elegida identifica el partido a analizar; no debe
                 # limitar el historial a esa fecha. Para un partido futuro,
                 # usamos los últimos partidos terminados de ambos equipos.
@@ -62,7 +125,8 @@ class Handler(SimpleHTTPRequestHandler):
                 lx=max(.15,(hs['gf']+avs['ga'])/2); ax=max(.15,(avs['gf']+hs['ga'])/2)
                 def pois(l,k): return math.exp(-l)*l**k/math.factorial(k)
                 probs={(i,j):pois(lx,i)*pois(ax,j) for i in range(8) for j in range(8)}; total=sum(probs.values()); hp=sum(v for (i,j),v in probs.items() if i>j)/total; dp=sum(v for (i,j),v in probs.items() if i==j)/total; ap=sum(v for (i,j),v in probs.items() if i<j)/total; o15=1-sum(v for (i,j),v in probs.items() if i+j<=1)/total; btts=sum(v for (i,j),v in probs.items() if i>0 and j>0)/total; ex=max(probs,key=probs.get)
-                self.send_json({'homeMatches':hm.get('matches',[]),'awayMatches':am.get('matches',[]),'engine':{'sampleSize':hs['matches']+avs['matches'],'probabilities':{'home':round(hp*100,1),'draw':round(dp*100,1),'away':round(ap*100,1),'over1_5':round(o15*100,1),'btts':round(btts*100,1)},'expectedGoals':{'home':round(lx,2),'away':round(ax,2)},'mostLikelyScore':f'{ex[0]}-{ex[1]}','date':target,'fixture':fixture,'historySeason':history_season,'method':'Poisson sobre promedios recientes'}}); return
+                af_stats=af_match_stats(home_name,away_name)
+                self.send_json({'homeMatches':hm.get('matches',[]),'awayMatches':am.get('matches',[]),'engine':{'sampleSize':hs['matches']+avs['matches'],'probabilities':{'home':round(hp*100,1),'draw':round(dp*100,1),'away':round(ap*100,1),'over1_5':round(o15*100,1),'btts':round(btts*100,1)},'expectedGoals':{'home':round(lx,2),'away':round(ax,2)},'mostLikelyScore':f'{ex[0]}-{ex[1]}','corners':af_stats.get('corners') if af_stats else None,'cards':af_stats.get('cards') if af_stats else None,'statsSource':af_stats.get('source') if af_stats else None,'date':target,'fixture':fixture,'historySeason':history_season,'method':'Poisson sobre promedios recientes'}}); return
             return SimpleHTTPRequestHandler.do_GET(self)
         except Exception as e: self.send_json({'error':'No se pudo consultar Football-Data.org','detail':str(e)},502)
 if __name__=='__main__':
