@@ -17,32 +17,50 @@ def af_api(path, params=None):
     req=urllib.request.Request(url, headers={'x-apisports-key':API_FOOTBALL_KEY or ''})
     with urllib.request.urlopen(req,timeout=20) as r: return json.load(r)
 AF_CACHE={}
+AF_RESPONSE_CACHE={}
+
+def af_api_cached(path, params=None):
+    key=(path,tuple(sorted((params or {}).items())))
+    if key in AF_RESPONSE_CACHE: return AF_RESPONSE_CACHE[key]
+    data=af_api(path,params)
+    if data.get('errors'):
+        return data
+    AF_RESPONSE_CACHE[key]=data
+    return data
+
 def af_team_id(name):
     key=('team',name)
     if key in AF_CACHE: return AF_CACHE[key]
-    try:
-        clean=name.replace(' FBPA','').replace(' FC','')
-        data=af_api('/teams',{'search':clean})
-        rows=data.get('response',[])
-        tid=rows[0].get('team',{}).get('id') if rows else None
-        AF_CACHE[key]=tid
-        return tid
-    except Exception:
-        return None
+    import unicodedata, re
+    clean=unicodedata.normalize('NFKD',name or '').encode('ascii','ignore').decode()
+    clean=re.sub(r'[^A-Za-z0-9 ]',' ',clean).replace(' FBPA','').replace(' FC','').strip()
+    n=re.sub(r'[^a-z0-9]','',clean.lower())
+    known={'gremio':130,'saopaulo':126,'alaves':542,'getafe':154,'realmadrid':541,'barcelona':529,'sevilla':536,'atleticodemadrid':530,'arsenal':42,'chelsea':49,'liverpool':40,'mancity':50}
+    tid=next((v for k,v in known.items() if n==k or n.startswith(k)),None)
+    if tid is None:
+        try:
+            rows=af_api_cached('/teams',{'search':clean}).get('response',[])
+            tid=rows[0].get('team',{}).get('id') if rows else None
+        except Exception:
+            tid=None
+    AF_CACHE[key]=tid
+    return tid
+
 def af_team_average(name):
-    """Promedio real de córners y tarjetas en los 5 partidos más recientes
-    disponibles en API-Football (la cuenta gratuita permite temporadas pasadas)."""
+    """Promedio real de córners y tarjetas en 3 partidos recientes de 2024.
+    Se limita el número de consultas para respetar el plan gratuito."""
     key=('avg',name)
     if key in AF_CACHE: return AF_CACHE[key]
     tid=af_team_id(name)
     if not tid: return None
     try:
-        rows=af_api('/fixtures',{'team':tid,'season':2024}).get('response',[])
-        rows=sorted([x for x in rows if x.get('fixture',{}).get('status',{}).get('short') in ('FT','AET','PEN')], key=lambda x:x.get('fixture',{}).get('date',''), reverse=True)[:5]
+        rows=af_api_cached('/fixtures',{'team':tid,'season':2024}).get('response',[])
+        rows=sorted([x for x in rows if x.get('fixture',{}).get('status',{}).get('short') in ('FT','AET','PEN')], key=lambda x:x.get('fixture',{}).get('date',''), reverse=True)[:3]
         totals=[]
         for row in rows:
             fid=row.get('fixture',{}).get('id')
-            data=af_api('/fixtures/statistics',{'fixture':fid})
+            data=af_api_cached('/fixtures/statistics',{'fixture':fid})
+            if data.get('errors'): continue
             corners=cards=0; has_corners=False; has_cards=False
             for team in data.get('response',[]):
                 for item in team.get('statistics',[]):
@@ -57,11 +75,12 @@ def af_team_average(name):
             if has_corners or has_cards: totals.append((corners if has_corners else None,cards if has_cards else None))
         if not totals: return None
         c=[x[0] for x in totals if x[0] is not None]; k=[x[1] for x in totals if x[1] is not None]
-        result={'corners':round(sum(c)/len(c),1) if c else None,'cards':round(sum(k)/len(k),1) if k else None,'source':'API-Football · promedio 5 partidos'}
+        result={'corners':round(sum(c)/len(c),1) if c else None,'cards':round(sum(k)/len(k),1) if k else None,'source':'API-Football · promedio 3 partidos'}
         AF_CACHE[key]=result
         return result
     except Exception:
         return None
+
 def af_match_stats(home_name, away_name):
     h=af_team_average(home_name); a=af_team_average(away_name)
     if not h and not a: return None
@@ -70,7 +89,7 @@ def af_match_stats(home_name, away_name):
         nums=[x[field] for x in (h,a) if x and x.get(field) is not None]
         if nums: vals[field]=round(sum(nums)/len(nums),1)
     vals['source']='API-Football · promedio histórico'
-    return vals if len(vals)>1 else None
+    return vals if any(k in vals for k in ('corners','cards')) else None
 
 class Handler(SimpleHTTPRequestHandler):
     def send_json(self,data,status=200):
