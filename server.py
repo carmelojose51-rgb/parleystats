@@ -132,20 +132,30 @@ class Handler(SimpleHTTPRequestHandler):
                     except Exception:
                         fixture=None
                 def stats(data,team):
-                    gf=ga=pts=n=0
+                    gf=ga=wins=draws=losses=clean=failed=over15=over25=btts=first_half_goals=n=0
+                    form=[]
                     for m in data.get('matches',[]):
-                        sc=m.get('score',{}).get('fullTime',{}); hg=sc.get('home'); ag=sc.get('away')
+                        sc=m.get('score',{}); ft=sc.get('fullTime',{}); hg=ft.get('home'); ag=ft.get('away')
                         if hg is None or ag is None: continue
-                        n+=1; ish=m.get('homeTeam',{}).get('id')==team; gf+=hg if ish else ag; ga+=ag if ish else hg; pts+=3 if (hg>ag if ish else ag>hg) else 1 if hg==ag else 0
-                    return {'matches':n,'gf':gf/n if n else 1.2,'ga':ga/n if n else 1.2}
+                        n+=1; ish=m.get('homeTeam',{}).get('id')==team
+                        team_gf=hg if ish else ag; team_ga=ag if ish else hg
+                        gf+=team_gf; ga+=team_ga
+                        if team_gf>team_ga: wins+=1; form.append('G')
+                        elif team_gf==team_ga: draws+=1; form.append('E')
+                        else: losses+=1; form.append('P')
+                        clean+=team_ga==0; failed+=team_gf==0
+                        over15+=(hg+ag)>1; over25+=(hg+ag)>2
+                        btts+=(hg>0 and ag>0)
+                        half=sc.get('halfTime',{}); first_half_goals+=(half.get('home') or 0)+(half.get('away') or 0)
+                    return {'matches':n,'gf':gf/n if n else 1.2,'ga':ga/n if n else 1.2,'wins':wins,'draws':draws,'losses':losses,'cleanSheets':clean,'failedToScore':failed,'over15':round(over15*100/n,1) if n else None,'over25':round(over25*100/n,1) if n else None,'btts':round(btts*100/n,1) if n else None,'firstHalfGoals':round(first_half_goals/n,2) if n else None,'form':'-'.join(form[:5])}
                 hs,avs=stats(hm,home),stats(am,away)
                 if hs['matches']==0 or avs['matches']==0:
                     self.send_json({'homeMatches':hm.get('matches',[]),'awayMatches':am.get('matches',[]),'engine':{'sampleSize':hs['matches']+avs['matches'],'dataAvailable':False,'historySeason':history_season,'date':target,'fixture':fixture,'historySeason':history_season,'method':'Poisson sobre promedios recientes'}}); return
                 lx=max(.15,(hs['gf']+avs['ga'])/2); ax=max(.15,(avs['gf']+hs['ga'])/2)
                 def pois(l,k): return math.exp(-l)*l**k/math.factorial(k)
-                probs={(i,j):pois(lx,i)*pois(ax,j) for i in range(8) for j in range(8)}; total=sum(probs.values()); hp=sum(v for (i,j),v in probs.items() if i>j)/total; dp=sum(v for (i,j),v in probs.items() if i==j)/total; ap=sum(v for (i,j),v in probs.items() if i<j)/total; o15=1-sum(v for (i,j),v in probs.items() if i+j<=1)/total; btts=sum(v for (i,j),v in probs.items() if i>0 and j>0)/total; ex=max(probs,key=probs.get)
+                probs={(i,j):pois(lx,i)*pois(ax,j) for i in range(8) for j in range(8)}; total=sum(probs.values()); hp=sum(v for (i,j),v in probs.items() if i>j)/total; dp=sum(v for (i,j),v in probs.items() if i==j)/total; ap=sum(v for (i,j),v in probs.items() if i<j)/total; o15=1-sum(v for (i,j),v in probs.items() if i+j<=1)/total; o25=1-sum(v for (i,j),v in probs.items() if i+j<=2)/total; u25=1-o25; btts=sum(v for (i,j),v in probs.items() if i>0 and j>0)/total; ex=max(probs,key=probs.get)
                 af_stats=af_match_stats(home_name,away_name)
-                self.send_json({'homeMatches':hm.get('matches',[]),'awayMatches':am.get('matches',[]),'engine':{'sampleSize':hs['matches']+avs['matches'],'probabilities':{'home':round(hp*100,1),'draw':round(dp*100,1),'away':round(ap*100,1),'over1_5':round(o15*100,1),'btts':round(btts*100,1)},'expectedGoals':{'home':round(lx,2),'away':round(ax,2)},'mostLikelyScore':f'{ex[0]}-{ex[1]}','corners':af_stats.get('corners') if af_stats else None,'cards':af_stats.get('cards') if af_stats else None,'statsSource':af_stats.get('source') if af_stats else None,'date':target,'fixture':fixture,'historySeason':history_season,'method':'Poisson sobre promedios recientes'}}); return
+                self.send_json({'homeMatches':hm.get('matches',[]),'awayMatches':am.get('matches',[]),'engine':{'sampleSize':hs['matches']+avs['matches'],'probabilities':{'home':round(hp*100,1),'draw':round(dp*100,1),'away':round(ap*100,1),'over1_5':round(o15*100,1),'over2_5':round(o25*100,1),'under2_5':round(u25*100,1),'btts':round(btts*100,1)},'expectedGoals':{'home':round(lx,2),'away':round(ax,2),'total':round(lx+ax,2)},'mostLikelyScore':f'{ex[0]}-{ex[1]}','corners':af_stats.get('corners') if af_stats else None,'cards':af_stats.get('cards') if af_stats else None,'statsSource':af_stats.get('source') if af_stats else None,'history':{'home':hs,'away':avs},'date':target,'fixture':fixture,'historySeason':history_season,'method':'Poisson sobre promedios recientes'}}); return
             return SimpleHTTPRequestHandler.do_GET(self)
         except Exception as e: self.send_json({'error':'No se pudo consultar Football-Data.org','detail':str(e)},502)
 if __name__=='__main__':
