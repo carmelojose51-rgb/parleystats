@@ -100,6 +100,16 @@ class Handler(SimpleHTTPRequestHandler):
             if p.path=='/api/competitions': self.send_json(api('/competitions')); return
             if p.path=='/api/teams': self.send_json(api('/competitions/%s/teams'%q['competition'][0])); return
             if p.path=='/api/matches': self.send_json(api('/matches',{'status':'LIVE'})); return
+            if p.path=='/api/upcoming':
+                start=q.get('dateFrom',[date.today().isoformat()])[0]
+                try: days=max(1,min(int(q.get('days',['7'])[0]),14))
+                except (ValueError,TypeError): days=7
+                try: start_date=date.fromisoformat(start)
+                except ValueError: start_date=date.today(); start=start_date.isoformat()
+                end=(start_date+timedelta(days=days-1)).isoformat()
+                data=api('/matches',{'dateFrom':start,'dateTo':end,'status':'SCHEDULED','limit':100})
+                data['dateFrom']=start; data['dateTo']=end; data['scope']='Todas las competiciones disponibles en Football-Data.org'
+                self.send_json(data); return
             if p.path=='/api/analyze':
                 home=int(q['home'][0]); away=int(q['away'][0]); target=q.get('date',[None])[0]; home_name=q.get('homeName',[''])[0]; away_name=q.get('awayName',[''])[0]
                 # La fecha elegida identifica el partido a analizar; no debe
