@@ -102,18 +102,21 @@ def live_data():
     if LIVE_CACHE['data'] is not None and now-LIVE_CACHE['at']<25:
         return LIVE_CACHE['data']
     start=date.today().isoformat(); end=(date.today()+timedelta(days=1)).isoformat()
-    found={}
-    # Football-Data devuelve algunos partidos como LIVE solo en
-    # /competitions/{code}/matches, no en /matches?status=LIVE.
+    found={}; day_found={}
+    # Football-Data devuelve algunos partidos como LIVE o FINISHED solo en
+    # /competitions/{code}/matches, no en la consulta global de /matches.
+    day_statuses=('SCHEDULED','LIVE','IN_PLAY','PAUSED','FINISHED')
     for code in LIVE_CODES:
         try:
             data=api('/competitions/%s/matches'%code,{'dateFrom':start,'dateTo':end,'limit':100})
             for m in data.get('matches',[]):
+                if m.get('status') in day_statuses:
+                    day_found[str(m.get('id'))]=m
                 if m.get('status') in ('LIVE','IN_PLAY','PAUSED'):
                     found[str(m.get('id'))]=m
         except Exception:
             continue
-    result={'matches':list(found.values()),'dateFrom':start,'dateTo':end,'source':'Football-Data.org · ligas en vivo'}
+    result={'matches':list(found.values()),'todayMatches':list(day_found.values()),'dateFrom':start,'dateTo':end,'source':'Football-Data.org · ligas en vivo'}
     LIVE_CACHE={'at':now,'data':result}
     return result
 
@@ -149,9 +152,9 @@ class Handler(SimpleHTTPRequestHandler):
                 # consulta general deja de devolverlo. Lo incluimos también
                 # en los destacados de hoy, además de la pestaña En vivo.
                 if start==date.today().isoformat():
-                    live=live_data().get('matches',[])
+                    day=live_data().get('todayMatches',[])
                     seen={str(m.get('id')) for m in data.get('matches',[])}
-                    data.setdefault('matches',[]).extend(m for m in live if str(m.get('id')) not in seen)
+                    data.setdefault('matches',[]).extend(m for m in day if str(m.get('id')) not in seen)
                     data.setdefault('resultSet',{})['count']=len(data.get('matches',[]))
                 data['dateFrom']=start; data['dateTo']=start; data['scope']='Partidos destacados del día'
                 self.send_json(data); return
