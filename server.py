@@ -96,6 +96,27 @@ def af_match_stats(home_name, away_name):
     vals['source']='API-Football · promedio histórico'
     return vals if any(k in vals for k in ('corners','cards')) else None
 
+def live_data():
+    global LIVE_CACHE
+    now=time.time()
+    if LIVE_CACHE['data'] is not None and now-LIVE_CACHE['at']<25:
+        return LIVE_CACHE['data']
+    start=date.today().isoformat(); end=(date.today()+timedelta(days=1)).isoformat()
+    found={}
+    # Football-Data devuelve algunos partidos como LIVE solo en
+    # /competitions/{code}/matches, no en /matches?status=LIVE.
+    for code in LIVE_CODES:
+        try:
+            data=api('/competitions/%s/matches'%code,{'dateFrom':start,'dateTo':end,'limit':100})
+            for m in data.get('matches',[]):
+                if m.get('status') in ('LIVE','IN_PLAY','PAUSED'):
+                    found[str(m.get('id'))]=m
+        except Exception:
+            continue
+    result={'matches':list(found.values()),'dateFrom':start,'dateTo':end,'source':'Football-Data.org · ligas en vivo'}
+    LIVE_CACHE={'at':now,'data':result}
+    return result
+
 class Handler(SimpleHTTPRequestHandler):
     def end_headers(self):
         self.send_header('Cache-Control','no-store, no-cache, must-revalidate, max-age=0')
@@ -110,25 +131,7 @@ class Handler(SimpleHTTPRequestHandler):
             if p.path=='/api/competitions': self.send_json(api('/competitions')); return
             if p.path=='/api/teams': self.send_json(api('/competitions/%s/teams'%q['competition'][0])); return
             if p.path=='/api/matches':
-                global LIVE_CACHE
-                now=time.time()
-                if LIVE_CACHE['data'] is not None and now-LIVE_CACHE['at']<25:
-                    self.send_json(LIVE_CACHE['data']); return
-                start=date.today().isoformat(); end=(date.today()+timedelta(days=1)).isoformat()
-                found={}
-                # Football-Data devuelve algunos partidos como LIVE solo en
-                # /competitions/{code}/matches, no en /matches?status=LIVE.
-                for code in LIVE_CODES:
-                    try:
-                        data=api('/competitions/%s/matches'%code,{'dateFrom':start,'dateTo':end,'limit':100})
-                        for m in data.get('matches',[]):
-                            if m.get('status') in ('LIVE','IN_PLAY','PAUSED'):
-                                found[str(m.get('id'))]=m
-                    except Exception:
-                        continue
-                result={'matches':list(found.values()),'dateFrom':start,'dateTo':end,'source':'Football-Data.org · ligas en vivo'}
-                LIVE_CACHE={'at':now,'data':result}
-                self.send_json(result); return
+                self.send_json(live_data()); return
             if p.path=='/api/upcoming':
                 start=q.get('dateFrom',[date.today().isoformat()])[0]
                 try: days=max(1,min(int(q.get('days',['7'])[0]),14))
@@ -142,7 +145,15 @@ class Handler(SimpleHTTPRequestHandler):
             if p.path=='/api/today':
                 start=q.get('date',[date.today().isoformat()])[0]
                 data=api('/matches',{'dateFrom':start,'dateTo':start,'status':'SCHEDULED','limit':100})
-                data['dateFrom']=start; data['dateTo']=start; data['scope']='Partidos programados del día'
+                # Si un partido ya comenzó, deja de ser SCHEDULED y la
+                # consulta general deja de devolverlo. Lo incluimos también
+                # en los destacados de hoy, además de la pestaña En vivo.
+                if start==date.today().isoformat():
+                    live=live_data().get('matches',[])
+                    seen={str(m.get('id')) for m in data.get('matches',[])}
+                    data.setdefault('matches',[]).extend(m for m in live if str(m.get('id')) not in seen)
+                    data.setdefault('resultSet',{})['count']=len(data.get('matches',[]))
+                data['dateFrom']=start; data['dateTo']=start; data['scope']='Partidos destacados del día'
                 self.send_json(data); return
             if p.path=='/api/analyze':
                 home=int(q['home'][0]); away=int(q['away'][0]); target=q.get('date',[None])[0]; home_name=q.get('homeName',[''])[0]; away_name=q.get('awayName',[''])[0]
