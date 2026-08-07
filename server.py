@@ -92,6 +92,11 @@ def af_match_stats(home_name, away_name):
     return vals if any(k in vals for k in ('corners','cards')) else None
 
 class Handler(SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header('Cache-Control','no-store, no-cache, must-revalidate, max-age=0')
+        self.send_header('Pragma','no-cache')
+        super().end_headers()
+
     def send_json(self,data,status=200):
         raw=json.dumps(data,ensure_ascii=False).encode(); self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8'); self.send_header('Content-Length',str(len(raw))); self.send_header('Access-Control-Allow-Origin','*'); self.end_headers(); self.wfile.write(raw)
     def do_GET(self):
