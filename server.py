@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, math, urllib.parse, urllib.request
+import json, os, math, time, urllib.parse, urllib.request
 from datetime import date, timedelta
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 TOKEN = os.environ.get('FOOTBALL_DATA_API_TOKEN')
@@ -18,6 +18,11 @@ def af_api(path, params=None):
     with urllib.request.urlopen(req,timeout=20) as r: return json.load(r)
 AF_CACHE={}
 AF_RESPONSE_CACHE={}
+LIVE_CACHE={'at':0,'data':None}
+# El endpoint global de Football-Data no siempre incluye los partidos que
+# aparecen con estado LIVE en la consulta de cada competición. Consultamos
+# las ligas activas más importantes y dejamos el resultado en caché breve.
+LIVE_CODES=('PPL','FL1','ELC','BSA','PD','SA','DED','PL','BL1')
 
 def af_api_cached(path, params=None):
     key=(path,tuple(sorted((params or {}).items())))
@@ -104,7 +109,26 @@ class Handler(SimpleHTTPRequestHandler):
             p=urllib.parse.urlparse(self.path); q=urllib.parse.parse_qs(p.query)
             if p.path=='/api/competitions': self.send_json(api('/competitions')); return
             if p.path=='/api/teams': self.send_json(api('/competitions/%s/teams'%q['competition'][0])); return
-            if p.path=='/api/matches': self.send_json(api('/matches',{'status':'LIVE'})); return
+            if p.path=='/api/matches':
+                global LIVE_CACHE
+                now=time.time()
+                if LIVE_CACHE['data'] is not None and now-LIVE_CACHE['at']<25:
+                    self.send_json(LIVE_CACHE['data']); return
+                start=date.today().isoformat(); end=(date.today()+timedelta(days=1)).isoformat()
+                found={}
+                # Football-Data devuelve algunos partidos como LIVE solo en
+                # /competitions/{code}/matches, no en /matches?status=LIVE.
+                for code in LIVE_CODES:
+                    try:
+                        data=api('/competitions/%s/matches'%code,{'dateFrom':start,'dateTo':end,'limit':100})
+                        for m in data.get('matches',[]):
+                            if m.get('status') in ('LIVE','IN_PLAY','PAUSED'):
+                                found[str(m.get('id'))]=m
+                    except Exception:
+                        continue
+                result={'matches':list(found.values()),'dateFrom':start,'dateTo':end,'source':'Football-Data.org · ligas en vivo'}
+                LIVE_CACHE={'at':now,'data':result}
+                self.send_json(result); return
             if p.path=='/api/upcoming':
                 start=q.get('dateFrom',[date.today().isoformat()])[0]
                 try: days=max(1,min(int(q.get('days',['7'])[0]),14))
