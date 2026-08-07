@@ -158,6 +158,16 @@ class Handler(SimpleHTTPRequestHandler):
                     data.setdefault('resultSet',{})['count']=len(data.get('matches',[]))
                 data['dateFrom']=start; data['dateTo']=start; data['scope']='Partidos destacados del día'
                 self.send_json(data); return
+            if p.path=='/api/fixture':
+                home=int(q['home'][0]); away=int(q['away'][0]); target=q.get('date',[None])[0]
+                fixture=None
+                if target:
+                    data=api('/teams/%s/matches'%home,{'dateFrom':target,'dateTo':target,'limit':100})
+                    for match in data.get('matches',[]):
+                        if match.get('homeTeam',{}).get('id')==away or match.get('awayTeam',{}).get('id')==away:
+                            fixture={'id':match.get('id'),'status':match.get('status'),'utcDate':match.get('utcDate'),'competition':match.get('competition',{}).get('name'),'score':match.get('score',{})}
+                            break
+                self.send_json({'fixture':fixture,'date':target}); return
             if p.path=='/api/analyze':
                 home=int(q['home'][0]); away=int(q['away'][0]); target=q.get('date',[None])[0]; home_name=q.get('homeName',[''])[0]; away_name=q.get('awayName',[''])[0]
                 # La fecha elegida identifica el partido a analizar; no debe
