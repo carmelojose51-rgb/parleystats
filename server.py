@@ -110,6 +110,11 @@ class Handler(SimpleHTTPRequestHandler):
                 data=api('/matches',{'dateFrom':start,'dateTo':end,'status':'SCHEDULED','limit':100})
                 data['dateFrom']=start; data['dateTo']=end; data['scope']='Todas las competiciones disponibles en Football-Data.org'
                 self.send_json(data); return
+            if p.path=='/api/today':
+                start=q.get('date',[date.today().isoformat()])[0]
+                data=api('/matches',{'dateFrom':start,'dateTo':start,'status':'SCHEDULED','limit':100})
+                data['dateFrom']=start; data['dateTo']=start; data['scope']='Partidos programados del día'
+                self.send_json(data); return
             if p.path=='/api/analyze':
                 home=int(q['home'][0]); away=int(q['away'][0]); target=q.get('date',[None])[0]; home_name=q.get('homeName',[''])[0]; away_name=q.get('awayName',[''])[0]
                 # La fecha elegida identifica el partido a analizar; no debe
@@ -137,7 +142,7 @@ class Handler(SimpleHTTPRequestHandler):
                         fixture_data=api('/teams/%s/matches'%home,{'dateFrom':target,'dateTo':target,'limit':100})
                         for match in fixture_data.get('matches',[]):
                             if match.get('homeTeam',{}).get('id')==away or match.get('awayTeam',{}).get('id')==away:
-                                fixture={'id':match.get('id'),'status':match.get('status'),'utcDate':match.get('utcDate'),'competition':match.get('competition',{}).get('name')}
+                                fixture={'id':match.get('id'),'status':match.get('status'),'utcDate':match.get('utcDate'),'competition':match.get('competition',{}).get('name'),'score':match.get('score',{})}
                                 break
                     except Exception:
                         fixture=None
@@ -164,8 +169,17 @@ class Handler(SimpleHTTPRequestHandler):
                 lx=max(.15,(hs['gf']+avs['ga'])/2); ax=max(.15,(avs['gf']+hs['ga'])/2)
                 def pois(l,k): return math.exp(-l)*l**k/math.factorial(k)
                 probs={(i,j):pois(lx,i)*pois(ax,j) for i in range(8) for j in range(8)}; total=sum(probs.values()); hp=sum(v for (i,j),v in probs.items() if i>j)/total; dp=sum(v for (i,j),v in probs.items() if i==j)/total; ap=sum(v for (i,j),v in probs.items() if i<j)/total; o15=1-sum(v for (i,j),v in probs.items() if i+j<=1)/total; o25=1-sum(v for (i,j),v in probs.items() if i+j<=2)/total; u25=1-o25; btts=sum(v for (i,j),v in probs.items() if i>0 and j>0)/total; ex=max(probs,key=probs.get)
+                outcomes=[('Local',hp),('Empate',dp),('Visitante',ap)]; signal,signal_prob=max(outcomes,key=lambda x:x[1]); sample=hs['matches']+avs['matches']; confidence='Alta' if signal_prob>=.67 and sample>=8 else ('Media' if signal_prob>=.52 else 'Baja')
+                home_rate=hs['wins']/hs['matches']; away_rate=avs['wins']/avs['matches']; reasons=[]
+                if home_rate>away_rate+.15: reasons.append('El local llega con mejor tasa de victorias reciente.')
+                elif away_rate>home_rate+.15: reasons.append('El visitante llega con mejor tasa de victorias reciente.')
+                if lx>ax+.35: reasons.append('El modelo proyecta más goles para el equipo local.')
+                elif ax>lx+.35: reasons.append('El modelo proyecta más goles para el equipo visitante.')
+                if hs['ga']<avs['ga']-.35: reasons.append('El local viene defendiendo mejor.')
+                elif avs['ga']<hs['ga']-.35: reasons.append('El visitante viene defendiendo mejor.')
+                if not reasons: reasons.append('Los datos recientes muestran una tendencia equilibrada.')
                 af_stats=af_match_stats(home_name,away_name)
-                self.send_json({'homeMatches':hm.get('matches',[]),'awayMatches':am.get('matches',[]),'engine':{'sampleSize':hs['matches']+avs['matches'],'probabilities':{'home':round(hp*100,1),'draw':round(dp*100,1),'away':round(ap*100,1),'over1_5':round(o15*100,1),'over2_5':round(o25*100,1),'under2_5':round(u25*100,1),'btts':round(btts*100,1)},'expectedGoals':{'home':round(lx,2),'away':round(ax,2),'total':round(lx+ax,2)},'mostLikelyScore':f'{ex[0]}-{ex[1]}','corners':af_stats.get('corners') if af_stats else None,'cards':af_stats.get('cards') if af_stats else None,'statsSource':af_stats.get('source') if af_stats else None,'history':{'home':hs,'away':avs},'date':target,'fixture':fixture,'historySeason':history_season,'method':'Poisson sobre promedios recientes'}}); return
+                self.send_json({'homeMatches':hm.get('matches',[]),'awayMatches':am.get('matches',[]),'engine':{'sampleSize':hs['matches']+avs['matches'],'probabilities':{'home':round(hp*100,1),'draw':round(dp*100,1),'away':round(ap*100,1),'over1_5':round(o15*100,1),'over2_5':round(o25*100,1),'under2_5':round(u25*100,1),'btts':round(btts*100,1)},'expectedGoals':{'home':round(lx,2),'away':round(ax,2),'total':round(lx+ax,2)},'mostLikelyScore':f'{ex[0]}-{ex[1]}','summary':{'signal':signal,'probability':round(signal_prob*100,1),'confidence':confidence,'reasons':reasons[:3]},'corners':af_stats.get('corners') if af_stats else None,'cards':af_stats.get('cards') if af_stats else None,'statsSource':af_stats.get('source') if af_stats else None,'history':{'home':hs,'away':avs},'date':target,'fixture':fixture,'historySeason':history_season,'method':'Poisson sobre promedios recientes'}}); return
             return SimpleHTTPRequestHandler.do_GET(self)
         except Exception as e: self.send_json({'error':'No se pudo consultar Football-Data.org','detail':str(e)},502)
 if __name__=='__main__':
