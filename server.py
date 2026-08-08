@@ -159,12 +159,26 @@ class Handler(SimpleHTTPRequestHandler):
                 data['dateFrom']=start; data['dateTo']=start; data['scope']='Partidos destacados del día'
                 self.send_json(data); return
             if p.path=='/api/fixture':
-                home=int(q['home'][0]); away=int(q['away'][0]); target=q.get('date',[None])[0]
+                home_raw=q.get('home',[None])[0]; away_raw=q.get('away',[None])[0]; target=q.get('date',[None])[0]
+                home=int(home_raw) if home_raw and str(home_raw).isdigit() else None
+                away=int(away_raw) if away_raw and str(away_raw).isdigit() else None
+                home_name=q.get('homeName',[''])[0]; away_name=q.get('awayName',[''])[0]
+                def name_key(v):
+                    import unicodedata
+                    return ''.join(c for c in unicodedata.normalize('NFKD',str(v or '')) if not unicodedata.combining(c)).lower().replace(' ','').replace('-','')
                 fixture=None
-                if target:
+                if target and home and away:
                     data=api('/teams/%s/matches'%home,{'dateFrom':target,'dateTo':target,'limit':100})
                     for match in data.get('matches',[]):
                         if match.get('homeTeam',{}).get('id')==away or match.get('awayTeam',{}).get('id')==away:
+                            fixture={'id':match.get('id'),'status':match.get('status'),'utcDate':match.get('utcDate'),'competition':match.get('competition',{}).get('name'),'score':match.get('score',{})}
+                            break
+                elif target and home_name and away_name:
+                    data=api('/matches',{'dateFrom':target,'dateTo':target,'status':'FINISHED','limit':100})
+                    hk,ak=name_key(home_name),name_key(away_name)
+                    for match in data.get('matches',[]):
+                        mh=name_key(match.get('homeTeam',{}).get('name')); ma=name_key(match.get('awayTeam',{}).get('name'))
+                        if (mh==hk and ma==ak) or (mh==ak and ma==hk):
                             fixture={'id':match.get('id'),'status':match.get('status'),'utcDate':match.get('utcDate'),'competition':match.get('competition',{}).get('name'),'score':match.get('score',{})}
                             break
                 self.send_json({'fixture':fixture,'date':target}); return
