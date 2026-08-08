@@ -1,16 +1,39 @@
 #!/usr/bin/env python3
-import json, os, math, time, urllib.parse, urllib.request
+import json, os, math, time, urllib.parse, urllib.request, urllib.error
 from datetime import date, timedelta
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 TOKEN = os.environ.get('FOOTBALL_DATA_API_TOKEN')
 API_FOOTBALL_KEY = os.environ.get('API_FOOTBALL_KEY')
 BASE = 'https://api.football-data.org/v4'
 AF_BASE = 'https://v3.football.api-sports.io'
+FD_CACHE={}
+def fd_cache_ttl(path, params):
+    params=params or {}
+    if path=='/competitions' or path.endswith('/teams'):
+        return 900
+    if '/matches' in path:
+        if params.get('status')=='FINISHED' or 'season' in params:
+            return 600
+        if 'dateFrom' in params or 'dateTo' in params:
+            return 45
+        return 30
+    return 300
+
 def api(path, params=None):
+    params=params or {}; key=(path,tuple(sorted(params.items()))); now=time.time(); cached=FD_CACHE.get(key); ttl=fd_cache_ttl(path,params)
+    if cached and now-cached[0]<ttl: return cached[1]
     url=BASE+path
     if params: url+='?'+urllib.parse.urlencode(params)
     req=urllib.request.Request(url, headers={'X-Auth-Token':TOKEN or ''})
-    with urllib.request.urlopen(req,timeout=20) as r: return json.load(r)
+    try:
+        with urllib.request.urlopen(req,timeout=20) as r: data=json.load(r)
+        FD_CACHE[key]=(now,data)
+        return data
+    except (urllib.error.HTTPError,urllib.error.URLError,TimeoutError):
+        # Si el proveedor limita temporalmente las consultas, reutilizamos el
+        # último dato válido en vez de dejar toda la aplicación en error.
+        if cached: return cached[1]
+        raise
 def af_api(path, params=None):
     url=AF_BASE+path
     if params: url+='?'+urllib.parse.urlencode(params)
@@ -159,26 +182,12 @@ class Handler(SimpleHTTPRequestHandler):
                 data['dateFrom']=start; data['dateTo']=start; data['scope']='Partidos destacados del día'
                 self.send_json(data); return
             if p.path=='/api/fixture':
-                home_raw=q.get('home',[None])[0]; away_raw=q.get('away',[None])[0]; target=q.get('date',[None])[0]
-                home=int(home_raw) if home_raw and str(home_raw).isdigit() else None
-                away=int(away_raw) if away_raw and str(away_raw).isdigit() else None
-                home_name=q.get('homeName',[''])[0]; away_name=q.get('awayName',[''])[0]
-                def name_key(v):
-                    import unicodedata
-                    return ''.join(c for c in unicodedata.normalize('NFKD',str(v or '')) if not unicodedata.combining(c)).lower().replace(' ','').replace('-','')
+                home=int(q['home'][0]); away=int(q['away'][0]); target=q.get('date',[None])[0]
                 fixture=None
-                if target and home and away:
+                if target:
                     data=api('/teams/%s/matches'%home,{'dateFrom':target,'dateTo':target,'limit':100})
                     for match in data.get('matches',[]):
                         if match.get('homeTeam',{}).get('id')==away or match.get('awayTeam',{}).get('id')==away:
-                            fixture={'id':match.get('id'),'status':match.get('status'),'utcDate':match.get('utcDate'),'competition':match.get('competition',{}).get('name'),'score':match.get('score',{})}
-                            break
-                elif target and home_name and away_name:
-                    data=api('/matches',{'dateFrom':target,'dateTo':target,'status':'FINISHED','limit':100})
-                    hk,ak=name_key(home_name),name_key(away_name)
-                    for match in data.get('matches',[]):
-                        mh=name_key(match.get('homeTeam',{}).get('name')); ma=name_key(match.get('awayTeam',{}).get('name'))
-                        if (mh==hk and ma==ak) or (mh==ak and ma==hk):
                             fixture={'id':match.get('id'),'status':match.get('status'),'utcDate':match.get('utcDate'),'competition':match.get('competition',{}).get('name'),'score':match.get('score',{})}
                             break
                 self.send_json({'fixture':fixture,'date':target}); return
