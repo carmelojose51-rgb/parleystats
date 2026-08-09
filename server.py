@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-import json, os, math, time, urllib.parse, urllib.request, urllib.error
+import json, os, math, time, threading, urllib.parse, urllib.request, urllib.error
 from datetime import date, timedelta
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 TOKEN = os.environ.get('FOOTBALL_DATA_API_TOKEN')
+ALLOWED_ORIGINS = {x.strip() for x in os.environ.get('ALLOWED_ORIGINS', 'https://carmelojose51-rgb.github.io,http://localhost:8080,http://127.0.0.1:8080').split(',') if x.strip()}
+RATE_LIMITS = {'/api/analyze': 12, '/api/fixture': 60, '/api/teams': 60, '/api/competitions': 30, '/api/upcoming': 30, '/api/today': 30, '/api/matches': 60}
+RATE_WINDOW = {}
+RATE_LOCK = threading.Lock()
 API_FOOTBALL_KEY = os.environ.get('API_FOOTBALL_KEY')
 BASE = 'https://api.football-data.org/v4'
 AF_BASE = 'https://v3.football.api-sports.io'
@@ -147,15 +151,57 @@ class Handler(SimpleHTTPRequestHandler):
     def end_headers(self):
         self.send_header('Cache-Control','no-store, no-cache, must-revalidate, max-age=0')
         self.send_header('Pragma','no-cache')
+        self.send_header('X-Content-Type-Options','nosniff')
+        self.send_header('Referrer-Policy','strict-origin-when-cross-origin')
+        self.send_header('Permissions-Policy','camera=(), microphone=(), geolocation=()')
         super().end_headers()
 
+    def client_key(self):
+        # Render puede poner la IP original en X-Forwarded-For. Solo se usa
+        # para limitar abusos; no se guarda en disco ni se devuelve al cliente.
+        return (self.headers.get('X-Forwarded-For','').split(',')[0].strip() or self.client_address[0])[:80]
+
+    def rate_allowed(self,path):
+        limit=RATE_LIMITS.get(path)
+        if not limit: return True
+        now=time.time(); key=(self.client_key(),path)
+        with RATE_LOCK:
+            hits=[t for t in RATE_WINDOW.get(key,[]) if now-t<60]
+            if len(hits)>=limit:
+                RATE_WINDOW[key]=hits
+                return False
+            hits.append(now); RATE_WINDOW[key]=hits
+            # Limpieza pequeña para que la memoria no crezca sin límite.
+            if len(RATE_WINDOW)>2000:
+                for k in list(RATE_WINDOW)[:500]: RATE_WINDOW.pop(k,None)
+        return True
+
     def send_json(self,data,status=200):
-        raw=json.dumps(data,ensure_ascii=False).encode(); self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8'); self.send_header('Content-Length',str(len(raw))); self.send_header('Access-Control-Allow-Origin','*'); self.end_headers(); self.wfile.write(raw)
+        raw=json.dumps(data,ensure_ascii=False).encode(); self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8'); self.send_header('Content-Length',str(len(raw)))
+        origin=self.headers.get('Origin')
+        if origin in ALLOWED_ORIGINS:
+            self.send_header('Access-Control-Allow-Origin',origin); self.send_header('Vary','Origin')
+        self.end_headers(); self.wfile.write(raw)
+
+    def do_OPTIONS(self):
+        origin=self.headers.get('Origin')
+        self.send_response(204)
+        if origin in ALLOWED_ORIGINS:
+            self.send_header('Access-Control-Allow-Origin',origin); self.send_header('Vary','Origin')
+        self.send_header('Access-Control-Allow-Methods','GET, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers','Content-Type')
+        self.end_headers()
+
     def do_GET(self):
         try:
             p=urllib.parse.urlparse(self.path); q=urllib.parse.parse_qs(p.query)
+            if p.path.startswith('/api/') and not self.rate_allowed(p.path):
+                self.send_json({'error':'Límite temporal de consultas alcanzado. Intenta nuevamente en un minuto.'},429); return
             if p.path=='/api/competitions': self.send_json(api('/competitions')); return
-            if p.path=='/api/teams': self.send_json(api('/competitions/%s/teams'%q['competition'][0])); return
+            if p.path=='/api/teams':
+                competition=q.get('competition',[''])[0]
+                if not competition.isdigit(): self.send_json({'error':'Competición no válida.'},400); return
+                self.send_json(api('/competitions/%s/teams'%competition)); return
             if p.path=='/api/matches':
                 self.send_json(live_data()); return
             if p.path=='/api/upcoming':
@@ -257,6 +303,8 @@ class Handler(SimpleHTTPRequestHandler):
                 af_stats=af_match_stats(home_name,away_name)
                 self.send_json({'homeMatches':hm.get('matches',[]),'awayMatches':am.get('matches',[]),'engine':{'sampleSize':hs['matches']+avs['matches'],'probabilities':{'home':round(hp*100,1),'draw':round(dp*100,1),'away':round(ap*100,1),'over1_5':round(o15*100,1),'over2_5':round(o25*100,1),'under2_5':round(u25*100,1),'btts':round(btts*100,1)},'expectedGoals':{'home':round(lx,2),'away':round(ax,2),'total':round(lx+ax,2)},'mostLikelyScore':f'{ex[0]}-{ex[1]}','summary':{'signal':signal,'probability':round(signal_prob*100,1),'confidence':confidence,'reasons':reasons[:3]},'corners':af_stats.get('corners') if af_stats else None,'cards':af_stats.get('cards') if af_stats else None,'statsSource':af_stats.get('source') if af_stats else None,'history':{'home':hs,'away':avs},'date':target,'fixture':fixture,'historySeason':history_season,'method':'Poisson sobre promedios recientes'}}); return
             return SimpleHTTPRequestHandler.do_GET(self)
-        except Exception as e: self.send_json({'error':'No se pudo consultar Football-Data.org','detail':str(e)},502)
+        except Exception as e:
+            print('Request error:', repr(e))
+            self.send_json({'error':'No se pudo completar la consulta. Intenta nuevamente.'},502)
 if __name__=='__main__':
     port=int(os.environ.get('PORT','10000')); print('ParleyStats en puerto',port); ThreadingHTTPServer(('0.0.0.0',port),Handler).serve_forever()

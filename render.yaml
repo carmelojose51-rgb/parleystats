@@ -6,3 +6,5 @@ services:
     envVars:
       - key: FOOTBALL_DATA_API_TOKEN
         sync: false
+      - key: ALLOWED_ORIGINS
+        value: https://carmelojose51-rgb.github.io
