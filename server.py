@@ -30,7 +30,7 @@ def api(path, params=None):
     if params: url+='?'+urllib.parse.urlencode(params)
     req=urllib.request.Request(url, headers={'X-Auth-Token':TOKEN or ''})
     try:
-        with urllib.request.urlopen(req,timeout=20) as r: data=json.load(r)
+        with urllib.request.urlopen(req,timeout=10) as r: data=json.load(r)
         FD_CACHE[key]=(now,data)
         return data
     except (urllib.error.HTTPError,urllib.error.URLError,TimeoutError):
@@ -46,6 +46,14 @@ def af_api(path, params=None):
 AF_CACHE={}
 AF_RESPONSE_CACHE={}
 LIVE_CACHE={'at':0,'data':None}
+LIVE_REFRESH_LOCK=threading.Lock()
+def refresh_live_async():
+    # No bloquea la primera carga después de que Render despierte.
+    if not LIVE_REFRESH_LOCK.acquire(blocking=False): return
+    def run():
+        try: live_data()
+        finally: LIVE_REFRESH_LOCK.release()
+    threading.Thread(target=run,daemon=True).start()
 # El endpoint global de Football-Data no siempre incluye los partidos que
 # aparecen con estado LIVE en la consulta de cada competición. Consultamos
 # las ligas activas más importantes y dejamos el resultado en caché breve.
@@ -203,7 +211,13 @@ class Handler(SimpleHTTPRequestHandler):
                 if not competition.isdigit(): self.send_json({'error':'Competición no válida.'},400); return
                 self.send_json(api('/competitions/%s/teams'%competition)); return
             if p.path=='/api/matches':
-                self.send_json(live_data()); return
+                # En una instancia recién despertada no esperamos las consultas
+                # de todas las ligas: respondemos rápido y actualizamos en segundo plano.
+                now=time.time()
+                if LIVE_CACHE['data'] is None or now-LIVE_CACHE['at']>=25:
+                    refresh_live_async()
+                    self.send_json(LIVE_CACHE['data'] or {'matches':[],'loading':True,'source':'Football-Data.org'}); return
+                self.send_json(LIVE_CACHE['data']); return
             if p.path=='/api/upcoming':
                 start=q.get('dateFrom',[date.today().isoformat()])[0]
                 try: days=max(1,min(int(q.get('days',['7'])[0]),14))
@@ -221,7 +235,15 @@ class Handler(SimpleHTTPRequestHandler):
                 # consulta general deja de devolverlo. Lo incluimos también
                 # en los destacados de hoy, además de la pestaña En vivo.
                 if start==date.today().isoformat():
-                    day=live_data().get('todayMatches',[])
+                    # Los partidos programados se entregan de inmediato.
+                    # La búsqueda adicional de partidos en vivo se actualiza
+                    # en segundo plano para que una instancia dormida no deje
+                    # la pantalla cargando durante minutos.
+                    if LIVE_CACHE['data'] is None or time.time()-LIVE_CACHE['at']>=25:
+                        refresh_live_async()
+                        day=[]
+                    else:
+                        day=LIVE_CACHE['data'].get('todayMatches',[])
                     seen={str(m.get('id')) for m in data.get('matches',[])}
                     data.setdefault('matches',[]).extend(m for m in day if str(m.get('id')) not in seen)
                     data.setdefault('resultSet',{})['count']=len(data.get('matches',[]))
