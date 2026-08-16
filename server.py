@@ -146,14 +146,18 @@ class Handler(SimpleHTTPRequestHandler):
             if p.path=='/api/today':
                 start=q.get('date',[date.today().isoformat()])[0]
                 try:
-                    data=api('/matches',{'dateFrom':start,'dateTo':start,'limit':100})
+                    end=(date.fromisoformat(start)+timedelta(days=1)).isoformat()
+                except ValueError:
+                    start=date.today().isoformat(); end=(date.today()+timedelta(days=1)).isoformat()
+                try:
+                    data=api('/matches',{'dateFrom':start,'dateTo':end,'limit':100})
                     if data.get('errorCode') or not isinstance(data.get('matches'),list) or not data.get('matches'): raise RuntimeError('all-day query unavailable')
                 except Exception:
                     # Algunas cuentas de Football-Data solo permiten la
                     # consulta de programados; usamos ese resultado como
                     # respaldo y añadimos los partidos en vivo aparte.
                     try:
-                        data=api('/matches',{'dateFrom':start,'dateTo':start,'status':'SCHEDULED','limit':100})
+                        data=api('/matches',{'dateFrom':start,'dateTo':end,'status':'SCHEDULED','limit':100})
                     except Exception:
                         data={'matches':[],'resultSet':{'count':0},'filters':{'dateFrom':start,'dateTo':start},'degraded':True}
                 # Si un partido ya comenzó, deja de ser SCHEDULED y la
@@ -172,7 +176,7 @@ class Handler(SimpleHTTPRequestHandler):
                     seen={str(m.get('id')) for m in data.get('matches',[])}
                     data.setdefault('matches',[]).extend(m for m in day if str(m.get('id')) not in seen)
                     data.setdefault('resultSet',{})['count']=len(data.get('matches',[]))
-                data['dateFrom']=start; data['dateTo']=start; data['scope']='Partidos destacados del día'
+                data['dateFrom']=start; data['dateTo']=end; data['scope']='Partidos destacados del día local'
                 self.send_json(data); return
             if p.path=='/api/fixture':
                 home=int(q['home'][0]); away=int(q['away'][0]); target=q.get('date',[None])[0]
