@@ -142,7 +142,10 @@ class Handler(SimpleHTTPRequestHandler):
                     # Algunas cuentas de Football-Data solo permiten la
                     # consulta de programados; usamos ese resultado como
                     # respaldo y añadimos los partidos en vivo aparte.
-                    data=api('/matches',{'dateFrom':start,'dateTo':start,'status':'SCHEDULED','limit':100})
+                    try:
+                        data=api('/matches',{'dateFrom':start,'dateTo':start,'status':'SCHEDULED','limit':100})
+                    except Exception:
+                        data={'matches':[],'resultSet':{'count':0},'filters':{'dateFrom':start,'dateTo':start},'degraded':True}
                 # Si un partido ya comenzó, deja de ser SCHEDULED y la
                 # consulta general deja de devolverlo. Lo incluimos también
                 # en los destacados de hoy, además de la pestaña En vivo.
