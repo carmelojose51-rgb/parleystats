@@ -172,19 +172,29 @@ class Handler(SimpleHTTPRequestHandler):
                 hist={'status':'FINISHED','limit':10}
                 hm=api('/teams/%s/matches'%home,hist); am=api('/teams/%s/matches'%away,hist)
                 history_season=None
-                # Si la temporada actual aún no comenzó, usamos la anterior
-                # para no fabricar estadísticas con valores de relleno.
-                if not hm.get('matches') or not am.get('matches'):
-                    try:
-                        fallback_year=(int(target[:4])-1) if target else (date.today().year-1)
-                        previous={'season':fallback_year,'status':'FINISHED','limit':10}
-                        old_hm=api('/teams/%s/matches'%home,previous)
-                        old_am=api('/teams/%s/matches'%away,previous)
-                        if old_hm.get('matches') and old_am.get('matches'):
-                            hm,am=old_hm,old_am
-                            history_season=fallback_year
-                    except (ValueError, TypeError):
-                        pass
+                # Si un equipo tiene menos de 10 partidos terminados en la
+                # temporada actual, completamos su muestra con la temporada
+                # anterior. Se hace por equipo, no solo cuando ambos están
+                # cortos, para que todos los análisis tengan una muestra útil.
+                try:
+                    fallback_year=(int(target[:4])-1) if target else (date.today().year-1)
+                    previous={'season':fallback_year,'status':'FINISHED','limit':10}
+                    def complete_history(team_id,current):
+                        rows=list(current.get('matches') or [])
+                        if len(rows)>=10:return current,False
+                        old=api('/teams/%s/matches'%team_id,previous)
+                        seen={str(x.get('id')) for x in rows}
+                        for match in old.get('matches') or []:
+                            if str(match.get('id')) not in seen:
+                                rows.append(match);seen.add(str(match.get('id')))
+                        rows.sort(key=lambda x:str(x.get('utcDate') or ''),reverse=True)
+                        result=dict(current);result['matches']=rows[:10]
+                        return result,len(rows)>len(current.get('matches') or [])
+                    hm,used_h=complete_history(home,hm)
+                    am,used_a=complete_history(away,am)
+                    if used_h or used_a:history_season=f'Actual + {fallback_year}'
+                except (ValueError, TypeError):
+                    pass
                 fixture=None
                 if target:
                     try:
