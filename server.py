@@ -147,7 +147,7 @@ class Handler(SimpleHTTPRequestHandler):
                 start=q.get('date',[date.today().isoformat()])[0]
                 try:
                     data=api('/matches',{'dateFrom':start,'dateTo':start,'limit':100})
-                    if data.get('errorCode'): raise RuntimeError('all-day query unavailable')
+                    if data.get('errorCode') or not isinstance(data.get('matches'),list) or not data.get('matches'): raise RuntimeError('all-day query unavailable')
                 except Exception:
                     # Algunas cuentas de Football-Data solo permiten la
                     # consulta de programados; usamos ese resultado como
