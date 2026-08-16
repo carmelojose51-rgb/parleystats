@@ -36,6 +36,16 @@ def api(path, params=None):
         # último dato válido en vez de dejar toda la aplicación en error.
         if cached: return cached[1]
         raise
+LIVE_CACHE={'at':0,'data':None}
+LIVE_REFRESH_LOCK=threading.Lock()
+def refresh_live_async():
+    # Actualiza partidos en segundo plano después de despertar Render.
+    if not LIVE_REFRESH_LOCK.acquire(blocking=False): return
+    def run():
+        try: live_data()
+        finally: LIVE_REFRESH_LOCK.release()
+    threading.Thread(target=run,daemon=True).start()
+
 def live_data():
     global LIVE_CACHE
     now=time.time()
