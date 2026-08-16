@@ -135,7 +135,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json(data); return
             if p.path=='/api/today':
                 start=q.get('date',[date.today().isoformat()])[0]
-                data=api('/matches',{'dateFrom':start,'dateTo':start,'status':'SCHEDULED','limit':100})
+                data=api('/matches',{'dateFrom':start,'dateTo':start,'limit':100})
                 # Si un partido ya comenzó, deja de ser SCHEDULED y la
                 # consulta general deja de devolverlo. Lo incluimos también
                 # en los destacados de hoy, además de la pestaña En vivo.
