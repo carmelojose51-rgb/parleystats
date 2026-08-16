@@ -21,8 +21,9 @@ def fd_cache_ttl(path, params):
         return 30
     return 300
 
-def api(path, params=None):
+def api(path, params=None, force=False):
     params=params or {}; key=(path,tuple(sorted(params.items()))); now=time.time(); cached=FD_CACHE.get(key); ttl=fd_cache_ttl(path,params)
+    if force: cached=None
     if cached and now-cached[0]<ttl: return cached[1]
     url=BASE+path
     if params: url+='?'+urllib.parse.urlencode(params)
@@ -46,10 +47,10 @@ def refresh_live_async():
         finally: LIVE_REFRESH_LOCK.release()
     threading.Thread(target=run,daemon=True).start()
 
-def live_data():
+def live_data(force=False):
     global LIVE_CACHE
     now=time.time()
-    if LIVE_CACHE['data'] is not None and now-LIVE_CACHE['at']<25:
+    if not force and LIVE_CACHE['data'] is not None and now-LIVE_CACHE['at']<25:
         return LIVE_CACHE['data']
     start=date.today().isoformat(); end=(date.today()+timedelta(days=1)).isoformat()
     found={}; day_found={}
@@ -126,6 +127,8 @@ class Handler(SimpleHTTPRequestHandler):
                 if not competition.isdigit(): self.send_json({'error':'Competición no válida.'},400); return
                 self.send_json(api('/competitions/%s/teams'%competition)); return
             if p.path=='/api/matches':
+                if q.get('refresh',['0'])[0]=='1':
+                    self.send_json(live_data(force=True)); return
                 # En una instancia recién despertada no esperamos las consultas
                 # de todas las ligas: respondemos rápido y actualizamos en segundo plano.
                 now=time.time()
@@ -171,7 +174,7 @@ class Handler(SimpleHTTPRequestHandler):
                 except ValueError:
                     start=date.today().isoformat(); end=(date.today()+timedelta(days=1)).isoformat()
                 try:
-                    data=api('/matches',{'dateFrom':start,'dateTo':end,'limit':100})
+                    data=api('/matches',{'dateFrom':start,'dateTo':end,'limit':100},force=q.get('refresh',['0'])[0]=='1')
                     if data.get('errorCode') or not isinstance(data.get('matches'),list) or not data.get('matches'): raise RuntimeError('all-day query unavailable')
                 except Exception:
                     # Algunas cuentas de Football-Data solo permiten la
