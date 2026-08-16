@@ -7,9 +7,7 @@ ALLOWED_ORIGINS = {x.strip() for x in os.environ.get('ALLOWED_ORIGINS', 'https:/
 RATE_LIMITS = {'/api/analyze': 12, '/api/fixture': 60, '/api/teams': 60, '/api/competitions': 30, '/api/upcoming': 30, '/api/today': 30, '/api/matches': 60}
 RATE_WINDOW = {}
 RATE_LOCK = threading.Lock()
-API_FOOTBALL_KEY = os.environ.get('API_FOOTBALL_KEY')
 BASE = 'https://api.football-data.org/v4'
-AF_BASE = 'https://v3.football.api-sports.io'
 FD_CACHE={}
 def fd_cache_ttl(path, params):
     params=params or {}
@@ -38,99 +36,6 @@ def api(path, params=None):
         # último dato válido en vez de dejar toda la aplicación en error.
         if cached: return cached[1]
         raise
-def af_api(path, params=None):
-    url=AF_BASE+path
-    if params: url+='?'+urllib.parse.urlencode(params)
-    req=urllib.request.Request(url, headers={'x-apisports-key':API_FOOTBALL_KEY or ''})
-    with urllib.request.urlopen(req,timeout=20) as r: return json.load(r)
-AF_CACHE={}
-AF_RESPONSE_CACHE={}
-LIVE_CACHE={'at':0,'data':None}
-LIVE_REFRESH_LOCK=threading.Lock()
-def refresh_live_async():
-    # No bloquea la primera carga después de que Render despierte.
-    if not LIVE_REFRESH_LOCK.acquire(blocking=False): return
-    def run():
-        try: live_data()
-        finally: LIVE_REFRESH_LOCK.release()
-    threading.Thread(target=run,daemon=True).start()
-# El endpoint global de Football-Data no siempre incluye los partidos que
-# aparecen con estado LIVE en la consulta de cada competición. Consultamos
-# las ligas activas más importantes y dejamos el resultado en caché breve.
-LIVE_CODES=('PPL','FL1','ELC','BSA','PD','SA','DED','PL','BL1')
-
-def af_api_cached(path, params=None):
-    key=(path,tuple(sorted((params or {}).items())))
-    if key in AF_RESPONSE_CACHE: return AF_RESPONSE_CACHE[key]
-    data=af_api(path,params)
-    if data.get('errors'):
-        return data
-    AF_RESPONSE_CACHE[key]=data
-    return data
-
-def af_team_id(name):
-    key=('team',name)
-    if key in AF_CACHE: return AF_CACHE[key]
-    import unicodedata, re
-    clean=unicodedata.normalize('NFKD',name or '').encode('ascii','ignore').decode()
-    clean=re.sub(r'[^A-Za-z0-9 ]',' ',clean).replace(' FBPA','').replace(' FC','').strip()
-    n=re.sub(r'[^a-z0-9]','',clean.lower())
-    known={'gremio':130,'saopaulo':126,'alaves':542,'getafe':154,'realmadrid':541,'barcelona':529,'sevilla':536,'atleticodemadrid':530,'arsenal':42,'chelsea':49,'liverpool':40,'mancity':50}
-    tid=next((v for k,v in known.items() if n==k or n.startswith(k)),None)
-    if tid is None:
-        try:
-            rows=af_api_cached('/teams',{'search':clean}).get('response',[])
-            tid=rows[0].get('team',{}).get('id') if rows else None
-        except Exception:
-            tid=None
-    AF_CACHE[key]=tid
-    return tid
-
-def af_team_average(name):
-    """Promedio real de córners y tarjetas en 3 partidos recientes de 2024.
-    Se limita el número de consultas para respetar el plan gratuito."""
-    key=('avg',name)
-    if key in AF_CACHE: return AF_CACHE[key]
-    tid=af_team_id(name)
-    if not tid: return None
-    try:
-        rows=af_api_cached('/fixtures',{'team':tid,'season':2024}).get('response',[])
-        rows=sorted([x for x in rows if x.get('fixture',{}).get('status',{}).get('short') in ('FT','AET','PEN')], key=lambda x:x.get('fixture',{}).get('date',''), reverse=True)[:3]
-        totals=[]
-        for row in rows:
-            fid=row.get('fixture',{}).get('id')
-            data=af_api_cached('/fixtures/statistics',{'fixture':fid})
-            if data.get('errors'): continue
-            corners=cards=0; has_corners=False; has_cards=False
-            for team in data.get('response',[]):
-                for item in team.get('statistics',[]):
-                    typ=item.get('type'); val=item.get('value')
-                    if isinstance(val,str):
-                        try: val=float(val.replace('%',''))
-                        except ValueError: val=None
-                    if typ=='Corner Kicks' and isinstance(val,(int,float)):
-                        corners+=val; has_corners=True
-                    if typ in ('Yellow Cards','Red Cards') and isinstance(val,(int,float)):
-                        cards+=val; has_cards=True
-            if has_corners or has_cards: totals.append((corners if has_corners else None,cards if has_cards else None))
-        if not totals: return None
-        c=[x[0] for x in totals if x[0] is not None]; k=[x[1] for x in totals if x[1] is not None]
-        result={'corners':round(sum(c)/len(c),1) if c else None,'cards':round(sum(k)/len(k),1) if k else None,'source':'API-Football · promedio 3 partidos'}
-        AF_CACHE[key]=result
-        return result
-    except Exception:
-        return None
-
-def af_match_stats(home_name, away_name):
-    h=af_team_average(home_name); a=af_team_average(away_name)
-    if not h and not a: return None
-    vals={}
-    for field in ('corners','cards'):
-        nums=[x[field] for x in (h,a) if x and x.get(field) is not None]
-        if nums: vals[field]=round(sum(nums)/len(nums),1)
-    vals['source']='API-Football · promedio histórico'
-    return vals if any(k in vals for k in ('corners','cards')) else None
-
 def live_data():
     global LIVE_CACHE
     now=time.time()
@@ -322,8 +227,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if hs['ga']<avs['ga']-.35: reasons.append('El local viene defendiendo mejor.')
                 elif avs['ga']<hs['ga']-.35: reasons.append('El visitante viene defendiendo mejor.')
                 if not reasons: reasons.append('Los datos recientes muestran una tendencia equilibrada.')
-                af_stats=af_match_stats(home_name,away_name)
-                self.send_json({'homeMatches':hm.get('matches',[]),'awayMatches':am.get('matches',[]),'engine':{'sampleSize':hs['matches']+avs['matches'],'probabilities':{'home':round(hp*100,1),'draw':round(dp*100,1),'away':round(ap*100,1),'over1_5':round(o15*100,1),'over2_5':round(o25*100,1),'under2_5':round(u25*100,1),'btts':round(btts*100,1)},'expectedGoals':{'home':round(lx,2),'away':round(ax,2),'total':round(lx+ax,2)},'mostLikelyScore':f'{ex[0]}-{ex[1]}','summary':{'signal':signal,'probability':round(signal_prob*100,1),'confidence':confidence,'reasons':reasons[:3]},'corners':af_stats.get('corners') if af_stats else None,'cards':af_stats.get('cards') if af_stats else None,'statsSource':af_stats.get('source') if af_stats else None,'history':{'home':hs,'away':avs},'date':target,'fixture':fixture,'historySeason':history_season,'method':'Poisson sobre promedios recientes'}}); return
+                self.send_json({'homeMatches':hm.get('matches',[]),'awayMatches':am.get('matches',[]),'engine':{'sampleSize':hs['matches']+avs['matches'],'probabilities':{'home':round(hp*100,1),'draw':round(dp*100,1),'away':round(ap*100,1),'over1_5':round(o15*100,1),'over2_5':round(o25*100,1),'under2_5':round(u25*100,1),'btts':round(btts*100,1)},'expectedGoals':{'home':round(lx,2),'away':round(ax,2),'total':round(lx+ax,2)},'mostLikelyScore':f'{ex[0]}-{ex[1]}','summary':{'signal':signal,'probability':round(signal_prob*100,1),'confidence':confidence,'reasons':reasons[:3]},'history':{'home':hs,'away':avs},'date':target,'fixture':fixture,'historySeason':history_season,'method':'Poisson sobre promedios recientes'}}); return
             return SimpleHTTPRequestHandler.do_GET(self)
         except Exception as e:
             print('Request error:', repr(e))
