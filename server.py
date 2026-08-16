@@ -140,8 +140,29 @@ class Handler(SimpleHTTPRequestHandler):
                 try: start_date=date.fromisoformat(start)
                 except ValueError: start_date=date.today(); start=start_date.isoformat()
                 end=(start_date+timedelta(days=days-1)).isoformat()
-                data=api('/matches',{'dateFrom':start,'dateTo':end,'status':'SCHEDULED','limit':100})
-                data['dateFrom']=start; data['dateTo']=end; data['scope']='Todas las competiciones disponibles en Football-Data.org'
+                # La consulta global a veces devuelve muy pocos partidos.
+                # Recorremos las ligas que la cuenta tiene disponibles y
+                # unimos sus resultados sin duplicados.
+                merged={}
+                try:
+                    comps=api('/competitions').get('competitions',[])
+                    for comp in comps:
+                        code=comp.get('code') or comp.get('id')
+                        if not code: continue
+                        try:
+                            part=api('/competitions/%s/matches'%code,{'dateFrom':start,'dateTo':end,'status':'SCHEDULED','limit':100})
+                            for m in part.get('matches',[]):
+                                if m.get('status') not in ('FINISHED','CANCELLED','POSTPONED'):
+                                    merged[str(m.get('id'))]=m
+                        except Exception:
+                            continue
+                except Exception:
+                    merged={}
+                if merged:
+                    data={'matches':list(merged.values()),'resultSet':{'count':len(merged)}}
+                else:
+                    data=api('/matches',{'dateFrom':start,'dateTo':end,'status':'SCHEDULED','limit':100})
+                data['dateFrom']=start; data['dateTo']=end; data['scope']='Ligas disponibles en Football-Data.org'
                 self.send_json(data); return
             if p.path=='/api/today':
                 start=q.get('date',[date.today().isoformat()])[0]
