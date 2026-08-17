@@ -153,9 +153,11 @@ class Handler(SimpleHTTPRequestHandler):
                         code=comp.get('code') or comp.get('id')
                         if not code: continue
                         try:
-                            part=api('/competitions/%s/matches'%code,{'dateFrom':start,'dateTo':end,'status':'SCHEDULED','limit':100})
+                            part=api('/competitions/%s/matches'%code,{'dateFrom':start,'dateTo':end,'limit':100})
                             for m in part.get('matches',[]):
-                                if m.get('status') not in ('FINISHED','CANCELLED','POSTPONED'):
+                                # Football-Data usa SCHEDULED y TIMED para
+                                # partidos futuros según la competición.
+                                if m.get('status') in ('SCHEDULED','TIMED'):
                                     merged[str(m.get('id'))]=m
                         except Exception:
                             continue
@@ -164,7 +166,8 @@ class Handler(SimpleHTTPRequestHandler):
                 if merged:
                     data={'matches':list(merged.values()),'resultSet':{'count':len(merged)}}
                 else:
-                    data=api('/matches',{'dateFrom':start,'dateTo':end,'status':'SCHEDULED','limit':100})
+                    data=api('/matches',{'dateFrom':start,'dateTo':end,'limit':100})
+                    data['matches']=[m for m in data.get('matches',[]) if m.get('status') in ('SCHEDULED','TIMED')]
                 data['dateFrom']=start; data['dateTo']=end; data['scope']='Ligas disponibles en Football-Data.org'
                 self.send_json(data); return
             if p.path=='/api/today':
