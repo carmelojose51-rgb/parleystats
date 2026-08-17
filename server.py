@@ -147,6 +147,17 @@ class Handler(SimpleHTTPRequestHandler):
                 # Recorremos las ligas que la cuenta tiene disponibles y
                 # unimos sus resultados sin duplicados.
                 merged={}
+                # La consulta global suele devolver partidos de varias
+                # competiciones en una sola llamada; la usamos primero para
+                # no perder encuentros cuando el proveedor limita consultas
+                # consecutivas por competición.
+                try:
+                    global_data=api('/matches',{'dateFrom':start,'dateTo':end,'limit':100})
+                    for m in global_data.get('matches',[]):
+                        if m.get('status') in ('SCHEDULED','TIMED'):
+                            merged[str(m.get('id'))]=m
+                except Exception:
+                    pass
                 try:
                     comps=api('/competitions').get('competitions',[])
                     for comp in comps:
