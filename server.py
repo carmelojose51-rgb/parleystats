@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import json, os, math, time, threading, urllib.parse, urllib.request, urllib.error
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 TOKEN = os.environ.get('FOOTBALL_DATA_API_TOKEN')
 ALLOWED_ORIGINS = {x.strip() for x in os.environ.get('ALLOWED_ORIGINS', 'https://carmelojose51-rgb.github.io,http://localhost:8080,http://127.0.0.1:8080').split(',') if x.strip()}
@@ -143,6 +143,7 @@ class Handler(SimpleHTTPRequestHandler):
                 try: start_date=date.fromisoformat(start)
                 except ValueError: start_date=date.today(); start=start_date.isoformat()
                 end=(start_date+timedelta(days=days-1)).isoformat()
+                query_end=(start_date+timedelta(days=1)).isoformat() if days==1 else end
                 # La consulta global a veces devuelve muy pocos partidos.
                 # Recorremos las ligas que la cuenta tiene disponibles y
                 # unimos sus resultados sin duplicados.
@@ -152,7 +153,7 @@ class Handler(SimpleHTTPRequestHandler):
                 # no perder encuentros cuando el proveedor limita consultas
                 # consecutivas por competición.
                 try:
-                    global_data=api('/matches',{'dateFrom':start,'dateTo':end,'limit':100})
+                    global_data=api('/matches',{'dateFrom':start,'dateTo':query_end,'limit':100})
                     for m in global_data.get('matches',[]):
                         if m.get('status') in ('SCHEDULED','TIMED'):
                             merged[str(m.get('id'))]=m
@@ -164,7 +165,7 @@ class Handler(SimpleHTTPRequestHandler):
                         code=comp.get('code') or comp.get('id')
                         if not code: continue
                         try:
-                            part=api('/competitions/%s/matches'%code,{'dateFrom':start,'dateTo':end,'limit':100})
+                            part=api('/competitions/%s/matches'%code,{'dateFrom':start,'dateTo':query_end,'limit':100})
                             for m in part.get('matches',[]):
                                 # Football-Data usa SCHEDULED y TIMED para
                                 # partidos futuros según la competición.
@@ -174,10 +175,18 @@ class Handler(SimpleHTTPRequestHandler):
                             continue
                 except Exception:
                     merged={}
+                if days==1:
+                    def in_requested_local_day(m):
+                        try:
+                            dt=datetime.fromisoformat(str(m.get('utcDate','')).replace('Z','+00:00'))
+                            return dt.astimezone(timezone(timedelta(hours=-5))).date().isoformat()==start
+                        except Exception:
+                            return str(m.get('utcDate',''))[:10]==start
+                    merged={k:m for k,m in merged.items() if in_requested_local_day(m)}
                 if merged:
                     data={'matches':list(merged.values()),'resultSet':{'count':len(merged)}}
                 else:
-                    data=api('/matches',{'dateFrom':start,'dateTo':end,'limit':100})
+                    data=api('/matches',{'dateFrom':start,'dateTo':query_end,'limit':100})
                     data['matches']=[m for m in data.get('matches',[]) if m.get('status') in ('SCHEDULED','TIMED')]
                 data['dateFrom']=start; data['dateTo']=end; data['scope']='Ligas disponibles en Football-Data.org'
                 self.send_json(data); return
