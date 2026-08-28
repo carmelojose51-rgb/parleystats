@@ -28,15 +28,19 @@ def api(path, params=None, force=False):
     url=BASE+path
     if params: url+='?'+urllib.parse.urlencode(params)
     req=urllib.request.Request(url, headers={'X-Auth-Token':TOKEN or ''})
-    try:
-        with urllib.request.urlopen(req,timeout=10) as r: data=json.load(r)
-        FD_CACHE[key]=(now,data)
-        return data
-    except (urllib.error.HTTPError,urllib.error.URLError,TimeoutError):
-        # Si el proveedor limita temporalmente las consultas, reutilizamos el
-        # último dato válido en vez de dejar toda la aplicación en error.
-        if cached: return cached[1]
-        raise
+    last_error=None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req,timeout=12) as r: data=json.load(r)
+            FD_CACHE[key]=(time.time(),data)
+            return data
+        except (urllib.error.HTTPError,urllib.error.URLError,TimeoutError) as exc:
+            last_error=exc
+            if attempt<2: time.sleep(1.5*(attempt+1))
+    # Si el proveedor limita temporalmente las consultas, reutilizamos el
+    # último dato válido en vez de dejar toda la aplicación en error.
+    if cached: return cached[1]
+    raise last_error
 LIVE_CACHE={'at':0,'data':None}
 LIVE_REFRESH_LOCK=threading.Lock()
 def refresh_live_async():
