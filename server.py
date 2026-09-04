@@ -163,22 +163,23 @@ class Handler(SimpleHTTPRequestHandler):
                             merged[str(m.get('id'))]=m
                 except Exception:
                     pass
-                try:
-                    comps=api('/competitions').get('competitions',[])
-                    for comp in comps:
-                        code=comp.get('code') or comp.get('id')
-                        if not code: continue
-                        try:
-                            part=api('/competitions/%s/matches'%code,{'dateFrom':start,'dateTo':query_end,'limit':100})
-                            for m in part.get('matches',[]):
-                                # Football-Data usa SCHEDULED y TIMED para
-                                # partidos futuros según la competición.
-                                if m.get('status') in ('SCHEDULED','TIMED'):
-                                    merged[str(m.get('id'))]=m
-                        except Exception:
-                            continue
-                except Exception:
-                    merged={}
+                if not merged:
+                    try:
+                        comps=api('/competitions').get('competitions',[])
+                        for comp in comps:
+                            code=comp.get('code') or comp.get('id')
+                            if not code: continue
+                            try:
+                                part=api('/competitions/%s/matches'%code,{'dateFrom':start,'dateTo':query_end,'limit':100})
+                                for m in part.get('matches',[]):
+                                    # Football-Data usa SCHEDULED y TIMED para
+                                    # partidos futuros según la competición.
+                                    if m.get('status') in ('SCHEDULED','TIMED'):
+                                        merged[str(m.get('id'))]=m
+                            except Exception:
+                                continue
+                    except Exception:
+                        merged={}
                 if days==1:
                     def in_requested_local_day(m):
                         try:
