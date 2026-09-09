@@ -241,12 +241,18 @@ class Handler(SimpleHTTPRequestHandler):
                             break
                 self.send_json({'fixture':fixture,'date':target}); return
             if p.path=='/api/analyze':
-                home=int(q['home'][0]); away=int(q['away'][0]); target=q.get('date',[None])[0]; home_name=q.get('homeName',[''])[0]; away_name=q.get('awayName',[''])[0]
+                home=int(q['home'][0]); away=int(q['away'][0]); target=q.get('date',[None])[0]; home_name=q.get('homeName',[''])[0]; away_name=q.get('awayName',[''])[0]; competition_id=str(q.get('competition',[''])[0] or '')
                 # La fecha elegida identifica el partido a analizar; no debe
                 # limitar el historial a esa fecha. Para un partido futuro,
                 # usamos los últimos partidos terminados de ambos equipos.
-                hist={'status':'FINISHED','limit':10}
+                hist={'status':'FINISHED','limit':100}
                 hm=api('/teams/%s/matches'%home,hist); am=api('/teams/%s/matches'%away,hist)
+                # Keep the analysis specific to the selected competition.
+                def only_competition(data):
+                    if not competition_id:return data
+                    rows=[m for m in (data.get('matches') or []) if str((m.get('competition') or {}).get('id',''))==competition_id or str((m.get('competition') or {}).get('code',''))==competition_id]
+                    result=dict(data);result['matches']=rows[:10];return result
+                hm=only_competition(hm); am=only_competition(am)
                 history_season=None
                 # Si un equipo tiene menos de 10 partidos terminados en la
                 # temporada actual, completamos su muestra con la temporada
@@ -254,11 +260,11 @@ class Handler(SimpleHTTPRequestHandler):
                 # cortos, para que todos los análisis tengan una muestra útil.
                 try:
                     fallback_year=(int(target[:4])-1) if target else (date.today().year-1)
-                    previous={'season':fallback_year,'status':'FINISHED','limit':10}
+                    previous={'season':fallback_year,'status':'FINISHED','limit':100}
                     def complete_history(team_id,current):
                         rows=list(current.get('matches') or [])
                         if len(rows)>=10:return current,False
-                        old=api('/teams/%s/matches'%team_id,previous)
+                        old=only_competition(api('/teams/%s/matches'%team_id,previous))
                         seen={str(x.get('id')) for x in rows}
                         for match in old.get('matches') or []:
                             if str(match.get('id')) not in seen:
