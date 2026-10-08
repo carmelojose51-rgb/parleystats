@@ -147,7 +147,9 @@ class Handler(SimpleHTTPRequestHandler):
                 try: start_date=date.fromisoformat(start)
                 except ValueError: start_date=date.today(); start=start_date.isoformat()
                 end=(start_date+timedelta(days=days-1)).isoformat()
-                query_end=(start_date+timedelta(days=1)).isoformat() if days==1 else end
+                # Pedimos hasta el día UTC posterior al último día de Colombia;
+                # luego filtramos por fecha local para no perder encuentros nocturnos.
+                query_end=(start_date+timedelta(days=days+1)).isoformat()
                 # La consulta global a veces devuelve muy pocos partidos.
                 # Recorremos las ligas que la cuenta tiene disponibles y
                 # unimos sus resultados sin duplicados.
@@ -180,19 +182,23 @@ class Handler(SimpleHTTPRequestHandler):
                                 continue
                     except Exception:
                         merged={}
-                if days==1:
-                    def in_requested_local_day(m):
-                        try:
-                            dt=datetime.fromisoformat(str(m.get('utcDate','')).replace('Z','+00:00'))
-                            return dt.astimezone(timezone(timedelta(hours=-5))).date().isoformat()==start
-                        except Exception:
-                            return str(m.get('utcDate',''))[:10]==start
-                    merged={k:m for k,m in merged.items() if in_requested_local_day(m)}
+                local_tz=timezone(timedelta(hours=-5))
+                def in_requested_local_range(m):
+                    try:
+                        dt=datetime.fromisoformat(str(m.get('utcDate','')).replace('Z','+00:00'))
+                        if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
+                        local_date=dt.astimezone(local_tz).date().isoformat()
+                        return start<=local_date<=end
+                    except Exception:
+                        match_date=str(m.get('utcDate',''))[:10]
+                        return start<=match_date<=end
+                merged={k:m for k,m in merged.items() if in_requested_local_range(m)}
                 if merged:
                     data={'matches':list(merged.values()),'resultSet':{'count':len(merged)}}
                 else:
-                    data=api('/matches',{'dateFrom':start,'dateTo':query_end,'limit':100})
-                    data['matches']=[m for m in data.get('matches',[]) if m.get('status') in ('SCHEDULED','TIMED')]
+                    fallback=api('/matches',{'dateFrom':start,'dateTo':query_end,'limit':100})
+                    data=dict(fallback)
+                    data['matches']=[m for m in fallback.get('matches',[]) if m.get('status') in ('SCHEDULED','TIMED') and in_requested_local_range(m)]
                 data['dateFrom']=start; data['dateTo']=end; data['scope']='Ligas disponibles en Football-Data.org'
                 self.send_json(data); return
             if p.path=='/api/today':
