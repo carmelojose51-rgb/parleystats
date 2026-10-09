@@ -9,6 +9,18 @@ RATE_WINDOW = {}
 RATE_LOCK = threading.Lock()
 BASE = 'https://api.football-data.org/v4'
 FD_CACHE={}
+COLOMBIA_TZ=timezone(timedelta(hours=-5))
+
+def colombia_local_date(utc_value):
+    if not utc_value:return None
+    try:
+        value=str(utc_value)
+        if value.endswith('Z'):value=value[:-1]+'+00:00'
+        dt=datetime.fromisoformat(value)
+        if dt.tzinfo is None:dt=dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(COLOMBIA_TZ).date().isoformat()
+    except (ValueError,TypeError):
+        return None
 def fd_cache_ttl(path, params):
     params=params or {}
     if path=='/competitions' or path.endswith('/teams'):
@@ -238,13 +250,22 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json(data); return
             if p.path=='/api/fixture':
                 home=int(q['home'][0]); away=int(q['away'][0]); target=q.get('date',[None])[0]
+                competition_id=str(q.get('competition',[''])[0] or '')
+                force_refresh=q.get('refresh',['0'])[0]=='1'
                 fixture=None
                 if target:
-                    data=api('/teams/%s/matches'%home,{'dateFrom':target,'dateTo':target,'limit':100})
+                    target_date=date.fromisoformat(target)
+                    query_end=(target_date+timedelta(days=1)).isoformat()
+                    params={'dateFrom':target,'dateTo':query_end,'limit':100}
+                    data=api('/teams/%s/matches'%home,params,force=force_refresh)
                     for match in data.get('matches',[]):
-                        if match.get('homeTeam',{}).get('id')==away or match.get('awayTeam',{}).get('id')==away:
-                            fixture={'id':match.get('id'),'status':match.get('status'),'utcDate':match.get('utcDate'),'competition':match.get('competition',{}).get('name'),'score':match.get('score',{})}
-                            break
+                        mh=match.get('homeTeam',{}).get('id'); ma=match.get('awayTeam',{}).get('id')
+                        if mh!=home or ma!=away:continue
+                        if colombia_local_date(match.get('utcDate'))!=target:continue
+                        comp=match.get('competition') or {}
+                        if competition_id and competition_id not in (str(comp.get('id','')),str(comp.get('code',''))):continue
+                        fixture={'id':match.get('id'),'status':match.get('status'),'utcDate':match.get('utcDate'),'competition':comp.get('name'),'score':match.get('score',{})}
+                        break
                 self.send_json({'fixture':fixture,'date':target}); return
             if p.path=='/api/analyze':
                 home=int(q['home'][0]); away=int(q['away'][0]); target=q.get('date',[None])[0]; home_name=q.get('homeName',[''])[0]; away_name=q.get('awayName',[''])[0]; competition_id=str(q.get('competition',[''])[0] or '')
