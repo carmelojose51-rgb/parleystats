@@ -1,0 +1,551 @@
+#!/usr/bin/env python3
+import json, os, math, time, threading, urllib.parse, urllib.request, urllib.error
+from datetime import date, timedelta, datetime, timezone
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+TOKEN = os.environ.get('FOOTBALL_DATA_API_TOKEN')
+ALLOWED_ORIGINS = {x.strip() for x in os.environ.get('ALLOWED_ORIGINS', 'https://carmelojose51-rgb.github.io,http://localhost:8080,http://127.0.0.1:8080').split(',') if x.strip()}
+RATE_LIMITS = {'/api/analyze': 12, '/api/fixture': 60, '/api/teams': 60, '/api/competitions': 30, '/api/upcoming': 30, '/api/today': 30, '/api/matches': 60}
+RATE_WINDOW = {}
+RATE_LOCK = threading.Lock()
+BASE = 'https://api.football-data.org/v4'
+FD_CACHE={}
+GOAL_BASE='https://api.goal-api.com/v1'
+GOAL_TOKEN=os.environ.get('GOAL_API_KEY','').strip()
+GOAL_LEAGUES={
+    'cmr77dvv600aprx06o7y7lnfu':{'apiId':'120','name':'Liga BetPlay','country':'Colombia'},
+    'cmr77dvtc0093rx0667jirsnv':{'apiId':'44','name':'Liga Profesional Argentina','country':'Argentina'},
+    'cmr77dvsv008srx06mier6t7r':{'apiId':'235','name':'Liga MX','country':'Mexico'},
+    'cmr77dvtx009krx06tw1t8obh':{'apiId':'332','name':'MLS','country':'Estados Unidos'},
+    'cmr77dw9g00gvrx06jlglb47m':{'apiId':'63','name':'First Division A','country':'Bélgica'},
+    'cmr77dx7h00rvrx060kholaxg':{'apiId':'209','name':'J1 League','country':'Japón'},
+    'cmr77dw0q00eprx06rqew3m48':{'apiId':'322','name':'Süper Lig','country':'Turquía'},
+}
+GOAL_LEAGUE_ID='cmr77dvv600aprx06o7y7lnfu'
+GOAL_LEAGUE_API_ID='120'
+GOAL_LEAGUE_LABEL='Liga BetPlay (GOAL API)'
+GOAL_DAILY_RESERVE=200
+GOAL_LOCAL_BUDGET=800
+GOAL_CACHE={}
+GOAL_LOCK=threading.RLock()
+GOAL_QUOTA={'date':None,'used':0,'remaining':None,'reset':None,'known':False}
+
+def goal_cache_ttl(path,params):
+    if path=='/leagues':return 21600
+    if path.endswith('/teams'):return 21600
+    if '/teams/' in path and path.endswith('/fixtures'):return 180
+    if '/leagues/' in path and path.endswith('/fixtures'):return 90
+    if path.startswith('/fixtures/'):return 300
+    return 300
+
+def goal_api(path,params=None,force=False):
+    if not GOAL_TOKEN:raise RuntimeError('GOAL API no está configurada')
+    params=params or {}; key=(path,tuple(sorted((str(k),str(v)) for k,v in params.items())))
+    now=time.time()
+    with GOAL_LOCK:
+        reset_at=GOAL_QUOTA.get('reset')
+        if reset_at and now>=reset_at:
+            GOAL_QUOTA.update(date=datetime.fromtimestamp(reset_at,timezone.utc).date().isoformat(),used=0,remaining=None,reset=None,known=False)
+        cached=GOAL_CACHE.get(key); ttl=goal_cache_ttl(path,params)
+        # Even an explicit refresh reuses fresh data: protects the daily free-plan quota.
+        if cached and now-cached[0]<ttl:return cached[1]
+        # On a cold boot, make at most one probe request to read the provider's real quota header.
+        # After that, never use GOAL API if the remaining server-reported quota reaches the reserve.
+        if GOAL_QUOTA['known'] and (GOAL_QUOTA['used']>=GOAL_LOCAL_BUDGET or (GOAL_QUOTA['remaining'] is not None and GOAL_QUOTA['remaining']<=GOAL_DAILY_RESERVE)):
+            raise RuntimeError('GOAL API alcanzó el umbral preventivo de consultas diarias; se conserva la cuota restante')
+        GOAL_QUOTA['used']+=1
+        url=GOAL_BASE+path
+        if params:url+='?'+urllib.parse.urlencode(params)
+        req=urllib.request.Request(url,headers={'Authorization':'Bearer '+GOAL_TOKEN,'Accept':'application/json','User-Agent':'ParleyStats/1.0'})
+        try:
+            with urllib.request.urlopen(req,timeout=15) as r:
+                data=json.load(r); remaining=r.headers.get('X-RateLimit-Remaining'); reset=r.headers.get('X-RateLimit-Reset')
+                if remaining is not None:GOAL_QUOTA['remaining']=int(remaining); GOAL_QUOTA['known']=True
+                if reset is not None:GOAL_QUOTA['reset']=int(reset); GOAL_QUOTA['date']=datetime.fromtimestamp(int(reset),timezone.utc).date().isoformat()
+            if not data.get('success',True):raise RuntimeError(data.get('message') or 'GOAL API request failed')
+            GOAL_CACHE[key]=(time.time(),data)
+            return data
+        except Exception:
+            # Conservatively retain the request in the local budget: uncertain responses may count.
+            raise
+
+def goal_prefix(value):return str(value or '').startswith('goal:')
+def goal_raw(value):return str(value or '')[5:] if goal_prefix(value) else str(value or '')
+def goal_normalize_match(m):
+    status=str(m.get('matchStatus') or '').upper()
+    if status in ('AFTER_PEN','AFTER_EXTRA_TIME','AET','PEN'):status='FINISHED'
+    def score(v):
+        try:return int(v) if v is not None and str(v).strip()!='' else None
+        except (ValueError,TypeError):return None
+    hg=score(m.get('homeTeamFtScore')); ag=score(m.get('awayTeamFtScore'))
+    hh=score(m.get('homeTeamHalftimeScore')); ah=score(m.get('awayTeamHalftimeScore'))
+    home=m.get('homeTeam') or {}; away=m.get('awayTeam') or {}
+    league_id=str(m.get('leagueId') or GOAL_LEAGUE_ID); league=GOAL_LEAGUES.get(league_id,{})
+    hid='goal:'+str(m.get('homeTeamId') or home.get('id') or '')
+    aid='goal:'+str(m.get('awayTeamId') or away.get('id') or '')
+    dt=m.get('kickoffUtc') or (str(m.get('matchDate',''))+'T'+str(m.get('matchTime','00:00'))+':00Z')
+    label=league.get('name') or m.get('leagueName') or 'Liga'
+    return {'id':m.get('id'),'status':status,'utcDate':dt,'homeTeam':{'id':hid,'name':m.get('homeTeamName') or home.get('name') or 'Local','crest':m.get('teamHomeBadge') or home.get('badge') or ''},'awayTeam':{'id':aid,'name':m.get('awayTeamName') or away.get('name') or 'Visitante','crest':m.get('teamAwayBadge') or away.get('badge') or ''},'competition':{'id':'goal:'+league_id,'code':'goal:'+str(league.get('apiId') or ''),'name':label},'score':{'winner':None,'duration':'REGULAR','fullTime':{'home':hg,'away':ag},'halfTime':{'home':hh,'away':ah}},'minute':m.get('matchElapsed'),'source':'GOAL API'}
+
+def goal_competitions():
+    rows=[]
+    for league_id,meta in GOAL_LEAGUES.items():
+        rows.append({'id':'goal:'+league_id,'code':'goal:'+meta['apiId'],'name':meta['name']+' (GOAL API)','type':'LEAGUE','area':{'name':meta['country']},'currentSeason':{'startDate':'2021-01-01','endDate':None,'currentMatchday':None},'source':'GOAL API'})
+    return {'competitions':rows}
+
+def goal_teams(league_id):
+    data=goal_api('/leagues/'+league_id+'/teams').get('data',[])
+    return {'teams':[{'id':'goal:'+str(t.get('id')),'name':t.get('name') or 'Equipo','crest':t.get('badge') or ''} for t in data if t.get('id') and t.get('name')]}
+
+def goal_team_matches(team_id,league_id,limit=100,offset=0,force=False):
+    data=goal_api('/teams/'+urllib.parse.quote(goal_raw(team_id),safe='')+'/fixtures',{'limit':limit,'offset':offset},force=force)
+    return [m for m in data.get('data',[]) if str(m.get('leagueId'))==str(league_id)]
+
+def goal_recent_history(team_id, league_id, opponent_id=None, target=None):
+    rows=[]; offset=0
+    while len(rows)<10 and offset<500:
+        page=goal_team_matches(team_id,league_id,100,offset)
+        if not page:break
+        for m in page:
+            if str(m.get('leagueId'))!=str(league_id):continue
+            if m.get('matchStatus')!='FINISHED':continue
+            if m.get('homeTeamFtScore') is None or m.get('awayTeamFtScore') is None:continue
+            if target and colombia_local_date(m.get('kickoffUtc')) and colombia_local_date(m.get('kickoffUtc'))>=target:continue
+            rows.append(m)
+        offset+=100
+        if len(page)<100:break
+    rows.sort(key=lambda m:str(m.get('kickoffUtc') or ''),reverse=True)
+    return [goal_normalize_match(m) for m in rows[:10]]
+
+def goal_find_fixture(home_id,away_id,target,league_id,force=False):
+    page=goal_api('/leagues/'+league_id+'/fixtures',{'limit':100,'offset':0},force=force).get('data',[])
+    for m in page:
+        if str(m.get('leagueId'))!=str(league_id):continue
+        if str(m.get('homeTeamId'))!=goal_raw(home_id) or str(m.get('awayTeamId'))!=goal_raw(away_id):continue
+        dt=m.get('kickoffUtc') or (str(m.get('matchDate',''))+'T00:00:00Z')
+        if target and colombia_local_date(dt)!=target:continue
+        return goal_normalize_match(m)
+    return None
+
+def goal_analysis(home_id,away_id,target,league_id):
+    label=GOAL_LEAGUES[league_id]['name']
+    fixture=goal_find_fixture(home_id,away_id,target,league_id) if target else None
+    hm=goal_recent_history(home_id,league_id,target=target); am=goal_recent_history(away_id,league_id,target=target)
+    def stats(matches,team):
+        gf=ga=wins=draws=losses=clean=failed=over15=over25=btts=ht_goals=ht_over=0; form=[]; n=0
+        for m in matches:
+            ft=m.get('score',{}).get('fullTime',{}); hg=ft.get('home'); ag=ft.get('away')
+            if hg is None or ag is None:continue
+            n+=1; is_home=m.get('homeTeam',{}).get('id')==team; scored,conceded=(hg,ag) if is_home else (ag,hg)
+            gf+=scored;ga+=conceded
+            if scored>conceded:wins+=1;form.append('G')
+            elif scored==conceded:draws+=1;form.append('E')
+            else:losses+=1;form.append('P')
+            clean+=conceded==0;failed+=scored==0;over15+=(hg+ag)>1;over25+=(hg+ag)>2;btts+=(hg>0 and ag>0)
+            half=m.get('score',{}).get('halfTime',{}); total=(half.get('home') or 0)+(half.get('away') or 0);ht_goals+=total;ht_over+=total>0
+        return {'matches':n,'gf':gf/n if n else 0,'ga':ga/n if n else 0,'wins':wins,'draws':draws,'losses':losses,'cleanSheets':clean,'failedToScore':failed,'over15':round(over15*100/n,1) if n else None,'over25':round(over25*100/n,1) if n else None,'btts':round(btts*100/n,1) if n else None,'firstHalfGoals':round(ht_goals/n,2) if n else None,'firstHalfOver05':round(ht_over*100/n,1) if n else None,'form':'-'.join(form[-5:])}
+    hs=stats(hm,home_id); avs=stats(am,away_id)
+    if hs['matches']<10 or avs['matches']<10:
+        return {'homeMatches':hm,'awayMatches':am,'engine':{'sampleSize':hs['matches']+avs['matches'],'dataAvailable':False,'date':target,'fixture':fixture,'method':f'Poisson sobre los últimos 10 partidos de {label}'}}
+    lx=max(.15,(hs['gf']+avs['ga'])/2); ax=max(.15,(avs['gf']+hs['ga'])/2)
+    def pois(l,k):return math.exp(-l)*l**k/math.factorial(k)
+    probs={(i,j):pois(lx,i)*pois(ax,j) for i in range(8) for j in range(8)}; total=sum(probs.values())
+    hp=sum(v for (i,j),v in probs.items() if i>j)/total; dp=sum(v for (i,j),v in probs.items() if i==j)/total; ap=sum(v for (i,j),v in probs.items() if i<j)/total
+    o15=1-sum(v for (i,j),v in probs.items() if i+j<=1)/total; o25=1-sum(v for (i,j),v in probs.items() if i+j<=2)/total; u25=1-o25; btts=sum(v for (i,j),v in probs.items() if i>0 and j>0)/total
+    hscores=1-math.exp(-lx); ascores=1-math.exp(-ax); ht05=((hs['firstHalfOver05'] or 0)+(avs['firstHalfOver05'] or 0))/200; ex=max(probs,key=probs.get)
+    outcomes=[('Local',hp),('Empate',dp),('Visitante',ap)]; signal,sp=max(outcomes,key=lambda z:z[1]); sample=hs['matches']+avs['matches']; confidence='Alta' if sp>=.67 and sample>=8 else ('Media' if sp>=.52 else 'Baja')
+    reasons=[]; hr=hs['wins']/hs['matches']; ar=avs['wins']/avs['matches']
+    if hr>ar+.15:reasons.append(f'El local llega con mejor tasa de victorias reciente en {label}.')
+    elif ar>hr+.15:reasons.append(f'El visitante llega con mejor tasa de victorias reciente en {label}.')
+    if lx>ax+.35:reasons.append('El modelo proyecta más goles para el equipo local.')
+    elif ax>lx+.35:reasons.append('El modelo proyecta más goles para el equipo visitante.')
+    if hs['ga']<avs['ga']-.35:reasons.append('El local viene defendiendo mejor.')
+    elif avs['ga']<hs['ga']-.35:reasons.append('El visitante viene defendiendo mejor.')
+    if not reasons:reasons.append(f'Los datos recientes de {label} muestran una tendencia equilibrada.')
+    return {'homeMatches':hm,'awayMatches':am,'engine':{'sampleSize':sample,'probabilities':{'home':round(hp*100,1),'draw':round(dp*100,1),'away':round(ap*100,1),'over1_5':round(o15*100,1),'over2_5':round(o25*100,1),'under2_5':round(u25*100,1),'btts':round(btts*100,1),'over0_5_ht':round(ht05*100,1),'home_scores':round(hscores*100,1),'away_scores':round(ascores*100,1),'double_1x':round((hp+dp)*100,1),'double_x2':round((dp+ap)*100,1),'double_12':round((hp+ap)*100,1)},'expectedGoals':{'home':round(lx,2),'away':round(ax,2),'total':round(lx+ax,2)},'mostLikelyScore':f'{ex[0]}-{ex[1]}','summary':{'signal':signal,'probability':round(sp*100,1),'confidence':confidence,'reasons':reasons[:3]},'history':{'home':hs,'away':avs},'date':target,'fixture':fixture,'method':f'Poisson · últimos 10 partidos finalizados de {label}','source':f'GOAL API · {label}'}}
+COLOMBIA_TZ=timezone(timedelta(hours=-5))
+
+def colombia_local_date(utc_value):
+    if not utc_value:return None
+    try:
+        value=str(utc_value)
+        if value.endswith('Z'):value=value[:-1]+'+00:00'
+        dt=datetime.fromisoformat(value)
+        if dt.tzinfo is None:dt=dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(COLOMBIA_TZ).date().isoformat()
+    except (ValueError,TypeError):
+        return None
+def fd_cache_ttl(path, params):
+    params=params or {}
+    if path=='/competitions' or path.endswith('/teams'):
+        return 900
+    if '/matches' in path:
+        if params.get('status')=='FINISHED' or 'season' in params:
+            return 600
+        if 'dateFrom' in params or 'dateTo' in params:
+            return 45
+        return 30
+    return 300
+
+def api(path, params=None, force=False):
+    params=params or {}; key=(path,tuple(sorted(params.items()))); now=time.time(); cached=FD_CACHE.get(key); ttl=fd_cache_ttl(path,params)
+    if force: cached=None
+    if cached and now-cached[0]<ttl: return cached[1]
+    url=BASE+path
+    if params: url+='?'+urllib.parse.urlencode(params)
+    req=urllib.request.Request(url, headers={'X-Auth-Token':TOKEN or ''})
+    last_error=None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req,timeout=12) as r: data=json.load(r)
+            FD_CACHE[key]=(time.time(),data)
+            return data
+        except (urllib.error.HTTPError,urllib.error.URLError,TimeoutError) as exc:
+            last_error=exc
+            if attempt<2: time.sleep(1.5*(attempt+1))
+    # Si el proveedor limita temporalmente las consultas, reutilizamos el
+    # último dato válido en vez de dejar toda la aplicación en error.
+    if cached: return cached[1]
+    raise last_error
+LIVE_CACHE={'at':0,'data':None}
+LIVE_REFRESH_LOCK=threading.Lock()
+def refresh_live_async():
+    # Actualiza partidos en segundo plano después de despertar Render.
+    if not LIVE_REFRESH_LOCK.acquire(blocking=False): return
+    def run():
+        try: live_data()
+        finally: LIVE_REFRESH_LOCK.release()
+    threading.Thread(target=run,daemon=True).start()
+
+def live_data(force=False):
+    global LIVE_CACHE
+    now=time.time()
+    if not force and LIVE_CACHE['data'] is not None and now-LIVE_CACHE['at']<25:
+        return LIVE_CACHE['data']
+    start=date.today().isoformat(); end=(date.today()+timedelta(days=1)).isoformat()
+    found={}; day_found={}
+    # Football-Data devuelve algunos partidos como LIVE o FINISHED solo en
+    # /competitions/{code}/matches, no en la consulta global de /matches.
+    day_statuses=('SCHEDULED','LIVE','IN_PLAY','PAUSED','FINISHED')
+    for code in LIVE_CODES:
+        try:
+            data=api('/competitions/%s/matches'%code,{'dateFrom':start,'dateTo':end,'limit':100})
+            for m in data.get('matches',[]):
+                if m.get('status') in day_statuses:
+                    day_found[str(m.get('id'))]=m
+                if m.get('status') in ('LIVE','IN_PLAY','PAUSED'):
+                    found[str(m.get('id'))]=m
+        except Exception:
+            continue
+    result={'matches':list(found.values()),'todayMatches':list(day_found.values()),'dateFrom':start,'dateTo':end,'source':'Football-Data.org · ligas en vivo'}
+    LIVE_CACHE={'at':now,'data':result}
+    return result
+
+class Handler(SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header('Cache-Control','no-store, no-cache, must-revalidate, max-age=0')
+        self.send_header('Pragma','no-cache')
+        self.send_header('X-Content-Type-Options','nosniff')
+        self.send_header('Referrer-Policy','strict-origin-when-cross-origin')
+        self.send_header('Permissions-Policy','camera=(), microphone=(), geolocation=()')
+        super().end_headers()
+
+    def client_key(self):
+        # Render puede poner la IP original en X-Forwarded-For. Solo se usa
+        # para limitar abusos; no se guarda en disco ni se devuelve al cliente.
+        return (self.headers.get('X-Forwarded-For','').split(',')[0].strip() or self.client_address[0])[:80]
+
+    def rate_allowed(self,path):
+        limit=RATE_LIMITS.get(path)
+        if not limit: return True
+        now=time.time(); key=(self.client_key(),path)
+        with RATE_LOCK:
+            hits=[t for t in RATE_WINDOW.get(key,[]) if now-t<60]
+            if len(hits)>=limit:
+                RATE_WINDOW[key]=hits
+                return False
+            hits.append(now); RATE_WINDOW[key]=hits
+            # Limpieza pequeña para que la memoria no crezca sin límite.
+            if len(RATE_WINDOW)>2000:
+                for k in list(RATE_WINDOW)[:500]: RATE_WINDOW.pop(k,None)
+        return True
+
+    def send_json(self,data,status=200):
+        raw=json.dumps(data,ensure_ascii=False).encode(); self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8'); self.send_header('Content-Length',str(len(raw)))
+        origin=self.headers.get('Origin')
+        if origin in ALLOWED_ORIGINS:
+            self.send_header('Access-Control-Allow-Origin',origin); self.send_header('Vary','Origin')
+        self.end_headers(); self.wfile.write(raw)
+
+    def do_OPTIONS(self):
+        origin=self.headers.get('Origin')
+        self.send_response(204)
+        if origin in ALLOWED_ORIGINS:
+            self.send_header('Access-Control-Allow-Origin',origin); self.send_header('Vary','Origin')
+        self.send_header('Access-Control-Allow-Methods','GET, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers','Content-Type')
+        self.end_headers()
+
+    def do_GET(self):
+        try:
+            p=urllib.parse.urlparse(self.path); q=urllib.parse.parse_qs(p.query)
+            if p.path.startswith('/api/') and not self.rate_allowed(p.path):
+                self.send_json({'error':'Límite temporal de consultas alcanzado. Intenta nuevamente en un minuto.'},429); return
+            if p.path=='/api/competitions':
+                data=api('/competitions'); comps=data.get('competitions',[]); comps.extend(goal_competitions()['competitions']); data['competitions']=comps; self.send_json(data); return
+            if p.path=='/api/goal-quota':
+                self.send_json({'source':'GOAL API','limit':1000,'remaining':GOAL_QUOTA.get('remaining'),'appRequests':GOAL_QUOTA.get('used',0),'reserve':GOAL_DAILY_RESERVE,'enabled':bool(GOAL_TOKEN),'quotaKnown':GOAL_QUOTA.get('known',False),'resetsAt':GOAL_QUOTA.get('reset')}); return
+            if p.path=='/api/teams':
+                competition=q.get('competition',[''])[0]
+                if goal_prefix(competition):
+                    league_id=goal_raw(competition)
+                    if league_id not in GOAL_LEAGUES:self.send_json({'error':'Liga GOAL no habilitada.'},400); return
+                    self.send_json(goal_teams(league_id)); return
+                if not competition.isdigit(): self.send_json({'error':'Competición no válida.'},400); return
+                self.send_json(api('/competitions/%s/teams'%competition)); return
+            if p.path=='/api/matches':
+                if q.get('refresh',['0'])[0]=='1':
+                    self.send_json(live_data(force=True)); return
+                # En una instancia recién despertada no esperamos las consultas
+                # de todas las ligas: respondemos rápido y actualizamos en segundo plano.
+                now=time.time()
+                if LIVE_CACHE['data'] is None or now-LIVE_CACHE['at']>=25:
+                    refresh_live_async()
+                    self.send_json(LIVE_CACHE['data'] or {'matches':[],'loading':True,'source':'Football-Data.org'}); return
+                self.send_json(LIVE_CACHE['data']); return
+            if p.path=='/api/upcoming':
+                start=q.get('dateFrom',[date.today().isoformat()])[0]
+                try: days=max(1,min(int(q.get('days',['7'])[0]),14))
+                except (ValueError,TypeError): days=7
+                try: start_date=date.fromisoformat(start)
+                except ValueError: start_date=date.today(); start=start_date.isoformat()
+                end=(start_date+timedelta(days=days-1)).isoformat()
+                # Pedimos hasta el día UTC posterior al último día de Colombia;
+                # luego filtramos por fecha local para no perder encuentros nocturnos.
+                query_end=(start_date+timedelta(days=days+1)).isoformat()
+                # La consulta global a veces devuelve muy pocos partidos.
+                # Recorremos las ligas que la cuenta tiene disponibles y
+                # unimos sus resultados sin duplicados.
+                merged={}
+                # La consulta global suele devolver partidos de varias
+                # competiciones en una sola llamada; la usamos primero para
+                # no perder encuentros cuando el proveedor limita consultas
+                # consecutivas por competición.
+                try:
+                    global_data=api('/matches',{'dateFrom':start,'dateTo':query_end,'limit':100})
+                    for m in global_data.get('matches',[]):
+                        if m.get('status') in ('SCHEDULED','TIMED'):
+                            merged[str(m.get('id'))]=m
+                except Exception:
+                    pass
+                if not merged:
+                    try:
+                        comps=api('/competitions').get('competitions',[])
+                        for comp in comps:
+                            code=comp.get('code') or comp.get('id')
+                            if not code: continue
+                            try:
+                                part=api('/competitions/%s/matches'%code,{'dateFrom':start,'dateTo':query_end,'limit':100})
+                                for m in part.get('matches',[]):
+                                    # Football-Data usa SCHEDULED y TIMED para
+                                    # partidos futuros según la competición.
+                                    if m.get('status') in ('SCHEDULED','TIMED'):
+                                        merged[str(m.get('id'))]=m
+                            except Exception:
+                                continue
+                    except Exception:
+                        merged={}
+                local_tz=timezone(timedelta(hours=-5))
+                def in_requested_local_range(m):
+                    try:
+                        dt=datetime.fromisoformat(str(m.get('utcDate','')).replace('Z','+00:00'))
+                        if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
+                        local_date=dt.astimezone(local_tz).date().isoformat()
+                        return start<=local_date<=end
+                    except Exception:
+                        match_date=str(m.get('utcDate',''))[:10]
+                        return start<=match_date<=end
+                merged={k:m for k,m in merged.items() if in_requested_local_range(m)}
+                if merged:
+                    data={'matches':list(merged.values()),'resultSet':{'count':len(merged)}}
+                else:
+                    fallback=api('/matches',{'dateFrom':start,'dateTo':query_end,'limit':100})
+                    data=dict(fallback)
+                    data['matches']=[m for m in fallback.get('matches',[]) if m.get('status') in ('SCHEDULED','TIMED') and in_requested_local_range(m)]
+                try:
+                    for league_id in GOAL_LEAGUES:
+                        gd=goal_api('/leagues/'+league_id+'/fixtures',{'limit':100,'offset':0}).get('data',[])
+                        for gm in gd:
+                            if str(gm.get('leagueId'))!=league_id:continue
+                            normalized=goal_normalize_match(gm)
+                            if normalized['status'] not in ('SCHEDULED','TIMED','LIVE','IN_PLAY','PAUSED'):continue
+                            local=colombia_local_date(normalized.get('utcDate'))
+                            if local and start<=local<=end:merged['goal:'+str(gm.get('id'))]=normalized
+                except Exception:pass
+                data={'matches':list(merged.values()),'resultSet':{'count':len(merged)},'dateFrom':start,'dateTo':end,'scope':'Ligas disponibles · Football-Data.org y GOAL API'}
+                self.send_json(data); return
+            if p.path=='/api/today':
+                start=q.get('date',[date.today().isoformat()])[0]
+                try:
+                    end=(date.fromisoformat(start)+timedelta(days=1)).isoformat()
+                except ValueError:
+                    start=date.today().isoformat(); end=(date.today()+timedelta(days=1)).isoformat()
+                try:
+                    data=api('/matches',{'dateFrom':start,'dateTo':end,'limit':100},force=q.get('refresh',['0'])[0]=='1')
+                    if data.get('errorCode') or not isinstance(data.get('matches'),list) or not data.get('matches'): raise RuntimeError('all-day query unavailable')
+                except Exception:
+                    # Algunas cuentas de Football-Data solo permiten la
+                    # consulta de programados; usamos ese resultado como
+                    # respaldo y añadimos los partidos en vivo aparte.
+                    try:
+                        data=api('/matches',{'dateFrom':start,'dateTo':end,'status':'SCHEDULED','limit':100})
+                    except Exception:
+                        data={'matches':[],'resultSet':{'count':0},'filters':{'dateFrom':start,'dateTo':start},'degraded':True}
+                # Si un partido ya comenzó, deja de ser SCHEDULED y la
+                # consulta general deja de devolverlo. Lo incluimos también
+                # en los destacados de hoy, además de la pestaña En vivo.
+                if start==date.today().isoformat():
+                    # Los partidos programados se entregan de inmediato.
+                    # La búsqueda adicional de partidos en vivo se actualiza
+                    # en segundo plano para que una instancia dormida no deje
+                    # la pantalla cargando durante minutos.
+                    if LIVE_CACHE['data'] is None or time.time()-LIVE_CACHE['at']>=25:
+                        refresh_live_async()
+                        day=[]
+                    else:
+                        day=LIVE_CACHE['data'].get('todayMatches',[])
+                    seen={str(m.get('id')) for m in data.get('matches',[])}
+                    data.setdefault('matches',[]).extend(m for m in day if str(m.get('id')) not in seen)
+                    data.setdefault('resultSet',{})['count']=len(data.get('matches',[]))
+                try:
+                    existing={str(m.get('id')) for m in data.get('matches',[])}
+                    for league_id in GOAL_LEAGUES:
+                        gd=goal_api('/leagues/'+league_id+'/fixtures',{'limit':100,'offset':0}).get('data',[])
+                        for gm in gd:
+                            if str(gm.get('leagueId'))!=league_id:continue
+                            normalized=goal_normalize_match(gm)
+                            if normalized.get('status') not in ('SCHEDULED','TIMED','LIVE','IN_PLAY','PAUSED','FINISHED'):continue
+                            if colombia_local_date(normalized.get('utcDate'))!=start:continue
+                            key=str(normalized.get('id'))
+                            if key not in existing:data.setdefault('matches',[]).append(normalized);existing.add(key)
+                except Exception:pass
+                data['dateFrom']=start; data['dateTo']=end; data['scope']='Partidos destacados · Football-Data.org y GOAL API'
+                self.send_json(data); return
+            if p.path=='/api/fixture':
+                raw_home=q.get('home',[''])[0]; raw_away=q.get('away',[''])[0]; target=q.get('date',[None])[0]
+                competition=str(q.get('competition',[''])[0] or '')
+                if goal_prefix(competition):
+                    league_id=goal_raw(competition)
+                    if league_id not in GOAL_LEAGUES or not (goal_prefix(raw_home) and goal_prefix(raw_away)):
+                        self.send_json({'fixture':None,'date':target,'source':'GOAL API'}); return
+                    fixture=goal_find_fixture(raw_home,raw_away,target,league_id,force=q.get('refresh',['0'])[0]=='1')
+                    self.send_json({'fixture':fixture,'date':target,'source':'GOAL API'}); return
+                home=int(raw_home); away=int(raw_away)
+                competition_id=str(q.get('competition',[''])[0] or '')
+                force_refresh=q.get('refresh',['0'])[0]=='1'
+                fixture=None
+                if target:
+                    target_date=date.fromisoformat(target)
+                    query_end=(target_date+timedelta(days=1)).isoformat()
+                    params={'dateFrom':target,'dateTo':query_end,'limit':100}
+                    data=api('/teams/%s/matches'%home,params,force=force_refresh)
+                    for match in data.get('matches',[]):
+                        mh=match.get('homeTeam',{}).get('id'); ma=match.get('awayTeam',{}).get('id')
+                        if mh!=home or ma!=away:continue
+                        if colombia_local_date(match.get('utcDate'))!=target:continue
+                        comp=match.get('competition') or {}
+                        if competition_id and competition_id not in (str(comp.get('id','')),str(comp.get('code',''))):continue
+                        fixture={'id':match.get('id'),'status':match.get('status'),'utcDate':match.get('utcDate'),'competition':comp.get('name'),'score':match.get('score',{})}
+                        break
+                self.send_json({'fixture':fixture,'date':target}); return
+            if p.path=='/api/analyze':
+                raw_home=q.get('home',[''])[0]; raw_away=q.get('away',[''])[0]; target=q.get('date',[None])[0]; competition_id=str(q.get('competition',[''])[0] or '')
+                if goal_prefix(competition_id):
+                    league_id=goal_raw(competition_id)
+                    if league_id not in GOAL_LEAGUES or not (goal_prefix(raw_home) and goal_prefix(raw_away)):
+                        self.send_json({'error':'Los equipos no corresponden a la liga seleccionada.'},400); return
+                    self.send_json(goal_analysis(raw_home,raw_away,target,league_id)); return
+                home=int(raw_home); away=int(raw_away); home_name=q.get('homeName',[''])[0]; away_name=q.get('awayName',[''])[0]
+                # La fecha elegida identifica el partido a analizar; no debe
+                # limitar el historial a esa fecha. Para un partido futuro,
+                # usamos los últimos partidos terminados de ambos equipos.
+                hist={'status':'FINISHED','limit':100}
+                hm=api('/teams/%s/matches'%home,hist); am=api('/teams/%s/matches'%away,hist)
+                # Keep the analysis specific to the selected competition.
+                def only_competition(data):
+                    if not competition_id:return data
+                    rows=[m for m in (data.get('matches') or []) if str((m.get('competition') or {}).get('id',''))==competition_id or str((m.get('competition') or {}).get('code',''))==competition_id]
+                    result=dict(data);result['matches']=rows[:10];return result
+                hm=only_competition(hm); am=only_competition(am)
+                history_season=None
+                # Si un equipo tiene menos de 10 partidos terminados en la
+                # temporada actual, completamos su muestra con la temporada
+                # anterior. Se hace por equipo, no solo cuando ambos están
+                # cortos, para que todos los análisis tengan una muestra útil.
+                try:
+                    fallback_year=(int(target[:4])-1) if target else (date.today().year-1)
+                    previous={'season':fallback_year,'status':'FINISHED','limit':100}
+                    def complete_history(team_id,current):
+                        rows=list(current.get('matches') or [])
+                        if len(rows)>=10:return current,False
+                        old=only_competition(api('/teams/%s/matches'%team_id,previous))
+                        seen={str(x.get('id')) for x in rows}
+                        for match in old.get('matches') or []:
+                            if str(match.get('id')) not in seen:
+                                rows.append(match);seen.add(str(match.get('id')))
+                        rows.sort(key=lambda x:str(x.get('utcDate') or ''),reverse=True)
+                        result=dict(current);result['matches']=rows[:10]
+                        return result,len(rows)>len(current.get('matches') or [])
+                    hm,used_h=complete_history(home,hm)
+                    am,used_a=complete_history(away,am)
+                    if used_h or used_a:history_season=f'Actual + {fallback_year}'
+                except (ValueError, TypeError):
+                    pass
+                fixture=None
+                if target:
+                    try:
+                        fixture_data=api('/teams/%s/matches'%home,{'dateFrom':target,'dateTo':target,'limit':100})
+                        for match in fixture_data.get('matches',[]):
+                            if match.get('homeTeam',{}).get('id')==away or match.get('awayTeam',{}).get('id')==away:
+                                fixture={'id':match.get('id'),'status':match.get('status'),'utcDate':match.get('utcDate'),'competition':match.get('competition',{}).get('name'),'score':match.get('score',{})}
+                                break
+                    except Exception:
+                        fixture=None
+                def stats(data,team):
+                    gf=ga=wins=draws=losses=clean=failed=over15=over25=btts=first_half_goals=first_half_over05=n=0
+                    form=[]
+                    for m in data.get('matches',[]):
+                        sc=m.get('score',{}); ft=sc.get('fullTime',{}); hg=ft.get('home'); ag=ft.get('away')
+                        if hg is None or ag is None: continue
+                        n+=1; ish=m.get('homeTeam',{}).get('id')==team
+                        team_gf=hg if ish else ag; team_ga=ag if ish else hg
+                        gf+=team_gf; ga+=team_ga
+                        if team_gf>team_ga: wins+=1; form.append('G')
+                        elif team_gf==team_ga: draws+=1; form.append('E')
+                        else: losses+=1; form.append('P')
+                        clean+=team_ga==0; failed+=team_gf==0
+                        over15+=(hg+ag)>1; over25+=(hg+ag)>2
+                        btts+=(hg>0 and ag>0)
+                        half=sc.get('halfTime',{}); first_half_goals+=(half.get('home') or 0)+(half.get('away') or 0); first_half_over05+=((half.get('home') or 0)+(half.get('away') or 0))>0
+                    return {'matches':n,'gf':gf/n if n else 1.2,'ga':ga/n if n else 1.2,'wins':wins,'draws':draws,'losses':losses,'cleanSheets':clean,'failedToScore':failed,'over15':round(over15*100/n,1) if n else None,'over25':round(over25*100/n,1) if n else None,'btts':round(btts*100/n,1) if n else None,'firstHalfGoals':round(first_half_goals/n,2) if n else None,'firstHalfOver05':round(first_half_over05*100/n,1) if n else None,'form':'-'.join(form[-5:])}
+                hs,avs=stats(hm,home),stats(am,away)
+                if hs['matches']==0 or avs['matches']==0:
+                    self.send_json({'homeMatches':hm.get('matches',[]),'awayMatches':am.get('matches',[]),'engine':{'sampleSize':hs['matches']+avs['matches'],'dataAvailable':False,'historySeason':history_season,'date':target,'fixture':fixture,'historySeason':history_season,'method':'Poisson sobre promedios recientes'}}); return
+                lx=max(.15,(hs['gf']+avs['ga'])/2); ax=max(.15,(avs['gf']+hs['ga'])/2)
+                def pois(l,k): return math.exp(-l)*l**k/math.factorial(k)
+                probs={(i,j):pois(lx,i)*pois(ax,j) for i in range(8) for j in range(8)}; total=sum(probs.values()); hp=sum(v for (i,j),v in probs.items() if i>j)/total; dp=sum(v for (i,j),v in probs.items() if i==j)/total; ap=sum(v for (i,j),v in probs.items() if i<j)/total; o15=1-sum(v for (i,j),v in probs.items() if i+j<=1)/total; o25=1-sum(v for (i,j),v in probs.items() if i+j<=2)/total; u25=1-o25; btts=sum(v for (i,j),v in probs.items() if i>0 and j>0)/total; home_scores=1-math.exp(-lx); away_scores=1-math.exp(-ax); ht05=((hs['firstHalfOver05'] or 0)+(avs['firstHalfOver05'] or 0))/200; ex=max(probs,key=probs.get)
+                outcomes=[('Local',hp),('Empate',dp),('Visitante',ap)]; signal,signal_prob=max(outcomes,key=lambda x:x[1]); sample=hs['matches']+avs['matches']; confidence='Alta' if signal_prob>=.67 and sample>=8 else ('Media' if signal_prob>=.52 else 'Baja')
+                home_rate=hs['wins']/hs['matches']; away_rate=avs['wins']/avs['matches']; reasons=[]
+                if home_rate>away_rate+.15: reasons.append('El local llega con mejor tasa de victorias reciente.')
+                elif away_rate>home_rate+.15: reasons.append('El visitante llega con mejor tasa de victorias reciente.')
+                if lx>ax+.35: reasons.append('El modelo proyecta más goles para el equipo local.')
+                elif ax>lx+.35: reasons.append('El modelo proyecta más goles para el equipo visitante.')
+                if hs['ga']<avs['ga']-.35: reasons.append('El local viene defendiendo mejor.')
+                elif avs['ga']<hs['ga']-.35: reasons.append('El visitante viene defendiendo mejor.')
+                if not reasons: reasons.append('Los datos recientes muestran una tendencia equilibrada.')
+                self.send_json({'homeMatches':hm.get('matches',[]),'awayMatches':am.get('matches',[]),'engine':{'sampleSize':hs['matches']+avs['matches'],'probabilities':{'home':round(hp*100,1),'draw':round(dp*100,1),'away':round(ap*100,1),'over1_5':round(o15*100,1),'over2_5':round(o25*100,1),'under2_5':round(u25*100,1),'btts':round(btts*100,1),'over0_5_ht':round(ht05*100,1),'home_scores':round(home_scores*100,1),'away_scores':round(away_scores*100,1),'double_1x':round((hp+dp)*100,1),'double_x2':round((dp+ap)*100,1),'double_12':round((hp+ap)*100,1)},'expectedGoals':{'home':round(lx,2),'away':round(ax,2),'total':round(lx+ax,2)},'mostLikelyScore':f'{ex[0]}-{ex[1]}','summary':{'signal':signal,'probability':round(signal_prob*100,1),'confidence':confidence,'reasons':reasons[:3]},'history':{'home':hs,'away':avs},'date':target,'fixture':fixture,'historySeason':history_season,'method':'Poisson sobre promedios recientes'}}); return
+            return SimpleHTTPRequestHandler.do_GET(self)
+        except Exception as e:
+            print('Request error:', repr(e))
+            self.send_json({'error':'No se pudo completar la consulta. Intenta nuevamente.'},502)
+if __name__=='__main__':
+    port=int(os.environ.get('PORT','10000')); print('ParleyStats en puerto',port); ThreadingHTTPServer(('0.0.0.0',port),Handler).serve_forever()
