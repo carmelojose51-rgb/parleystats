@@ -46,7 +46,7 @@ def goal_api(path,params=None,force=False):
         GOAL_QUOTA['used']+=1
         url=GOAL_BASE+path
         if params:url+='?'+urllib.parse.urlencode(params)
-        req=urllib.request.Request(url,headers={'Authorization':'Bearer '+GOAL_TOKEN,'Accept':'application/json'})
+        req=urllib.request.Request(url,headers={'Authorization':'Bearer '+GOAL_TOKEN,'Accept':'application/json','User-Agent':'ParleyStats/1.0'})
         try:
             with urllib.request.urlopen(req,timeout=15) as r:
                 data=json.load(r); remaining=r.headers.get('X-RateLimit-Remaining'); reset=r.headers.get('X-RateLimit-Reset')
