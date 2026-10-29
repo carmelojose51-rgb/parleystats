@@ -227,7 +227,7 @@ def goal_normalize_match(m):
     aid='goal:'+str(m.get('awayTeamId') or away.get('id') or '')
     dt=m.get('kickoffUtc') or (str(m.get('matchDate',''))+'T'+str(m.get('matchTime','00:00'))+':00Z')
     label=league.get('name') or m.get('leagueName') or 'Liga'
-    return {'id':m.get('id'),'status':status,'utcDate':dt,'homeTeam':{'id':hid,'name':m.get('homeTeamName') or home.get('name') or 'Local','crest':m.get('teamHomeBadge') or home.get('badge') or ''},'awayTeam':{'id':aid,'name':m.get('awayTeamName') or away.get('name') or 'Visitante','crest':m.get('teamAwayBadge') or away.get('badge') or ''},'competition':{'id':'goal:'+league_id,'code':'goal:'+str(league.get('apiId') or ''),'name':label},'score':{'winner':None,'duration':'REGULAR','fullTime':{'home':hg,'away':ag},'halfTime':{'home':hh,'away':ah}},'minute':m.get('matchElapsed'),'source':'GOAL API'}
+    return {'id':m.get('id'),'status':status,'utcDate':dt,'homeTeam':{'id':hid,'name':m.get('homeTeamName') or home.get('name') or 'Local','crest':m.get('teamHomeBadge') or home.get('badge') or ''},'awayTeam':{'id':aid,'name':m.get('awayTeamName') or away.get('name') or 'Visitante','crest':m.get('teamAwayBadge') or away.get('badge') or ''},'competition':{'id':'goal:'+league_id,'code':'goal:'+str(league.get('apiId') or ''),'name':label,'area':{'name':league.get('country') or m.get('countryName') or ''}},'area':{'name':league.get('country') or m.get('countryName') or ''},'score':{'winner':None,'duration':'REGULAR','fullTime':{'home':hg,'away':ag},'halfTime':{'home':hh,'away':ah}},'minute':m.get('matchElapsed'),'source':'GOAL API'}
 
 def goal_competitions():
     rows=[]
