@@ -514,28 +514,43 @@ class Handler(SimpleHTTPRequestHandler):
                     fallback=api('/matches',{'dateFrom':start,'dateTo':query_end,'limit':100})
                     data=dict(fallback)
                     data['matches']=[m for m in fallback.get('matches',[]) if m.get('status') in ('SCHEDULED','TIMED') and in_requested_local_range(m)]
-                # GOAL tiene muchas ligas habilitadas. Consultarlas una a una
-                # bloqueaba la respuesta y una sola falla abortaba las restantes.
-                # La caché por competición, pool acotado y errores aislados hacen
-                # la primera carga rápida y protegen la cuota diaria.
-                def fetch_goal_upcoming(league_id):
-                    try:
-                        gd=goal_api('/leagues/'+league_id+'/fixtures',{'limit':100,'offset':0}).get('data',[])
-                        found=[]
-                        for gm in gd:
-                            if str(gm.get('leagueId'))!=league_id:continue
+                # Consultamos GOAL por día, no una vez por cada una de las
+                # 149 ligas. Paginamos el día completo y filtramos IDs exactos
+                # para conservar todos los partidos de las ligas habilitadas.
+                # Las páginas van en serie para que la cuota reportada se actualice
+                # antes de solicitar otra y nunca se consuma la reserva preventiva.
+                goal_incomplete=False
+                enabled_goal_ids=set(GOAL_LEAGUES)
+                utc_days=[(start_date+timedelta(days=i)).isoformat() for i in range(days+1)]
+                def fetch_goal_date(day):
+                    found=[]; offset=0; total=None
+                    while total is None or offset<total:
+                        try:
+                            page=goal_api('/fixtures/date/'+day,{'limit':100,'offset':offset})
+                        except Exception:
+                            return None
+                        rows=page.get('data',[])
+                        for gm in rows:
+                            league_id=str(gm.get('leagueId') or '')
+                            if league_id not in enabled_goal_ids:continue
                             normalized=goal_normalize_match(gm)
                             if normalized['status'] not in ('SCHEDULED','TIMED','LIVE','IN_PLAY','PAUSED'):continue
                             local=colombia_local_date(normalized.get('utcDate'))
                             if local and start<=local<=end:found.append(('goal:'+str(gm.get('id')),normalized))
-                        return found
-                    except Exception:
-                        return []
-                with ThreadPoolExecutor(max_workers=16) as pool:
-                    futures=[pool.submit(fetch_goal_upcoming,league_id) for league_id in GOAL_LEAGUES]
-                    for future in as_completed(futures):
-                        for match_id,normalized in future.result():merged[match_id]=normalized
+                        pagination=page.get('pagination') or {}
+                        try:total=int(pagination.get('total',len(rows)))
+                        except (ValueError,TypeError):total=len(rows)
+                        if not rows or len(rows)<100:break
+                        offset+=len(rows)
+                    return found
+                for goal_day in utc_days:
+                    result=fetch_goal_date(goal_day)
+                    if result is None:
+                        goal_incomplete=True
+                        continue
+                    for match_id,normalized in result:merged[match_id]=normalized
                 data={'matches':list(merged.values()),'resultSet':{'count':len(merged)},'dateFrom':start,'dateTo':end,'scope':'Ligas disponibles · Football-Data.org y GOAL API'}
+                if goal_incomplete:data['goalWarning']='GOAL API no está disponible o alcanzó la reserva preventiva; algunos encuentros de esas ligas podrían faltar.'
                 self.send_json(data); return
             if p.path=='/api/today':
                 start=q.get('date',[date.today().isoformat()])[0]
