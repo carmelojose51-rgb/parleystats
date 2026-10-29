@@ -2,6 +2,7 @@
 import json, os, math, time, threading, urllib.parse, urllib.request, urllib.error
 from datetime import date, timedelta, datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from concurrent.futures import ThreadPoolExecutor, as_completed
 TOKEN = os.environ.get('FOOTBALL_DATA_API_TOKEN')
 ALLOWED_ORIGINS = {x.strip() for x in os.environ.get('ALLOWED_ORIGINS', 'https://carmelojose51-rgb.github.io,http://localhost:8080,http://127.0.0.1:8080').split(',') if x.strip()}
 RATE_LIMITS = {'/api/analyze': 12, '/api/fixture': 60, '/api/teams': 60, '/api/competitions': 30, '/api/upcoming': 30, '/api/today': 30, '/api/matches': 60}
@@ -175,7 +176,7 @@ def goal_cache_ttl(path,params):
     if path=='/leagues':return 21600
     if path.endswith('/teams'):return 21600
     if '/teams/' in path and path.endswith('/fixtures'):return 180
-    if '/leagues/' in path and path.endswith('/fixtures'):return 90
+    if '/leagues/' in path and path.endswith('/fixtures'):return 300
     if path.startswith('/fixtures/'):return 300
     return 300
 
@@ -183,32 +184,32 @@ def goal_api(path,params=None,force=False):
     if not GOAL_TOKEN:raise RuntimeError('GOAL API no está configurada')
     params=params or {}; key=(path,tuple(sorted((str(k),str(v)) for k,v in params.items())))
     now=time.time()
+    # Reservamos cuota y consultamos caché bajo lock, pero jamás retenemos el
+    # lock durante I/O de red: así las consultas independientes sí corren juntas.
     with GOAL_LOCK:
         reset_at=GOAL_QUOTA.get('reset')
         if reset_at and now>=reset_at:
             GOAL_QUOTA.update(date=datetime.fromtimestamp(reset_at,timezone.utc).date().isoformat(),used=0,remaining=None,reset=None,known=False)
         cached=GOAL_CACHE.get(key); ttl=goal_cache_ttl(path,params)
-        # Even an explicit refresh reuses fresh data: protects the daily free-plan quota.
         if cached and now-cached[0]<ttl:return cached[1]
-        # On a cold boot, make at most one probe request to read the provider's real quota header.
-        # After that, never use GOAL API if the remaining server-reported quota reaches the reserve.
         if GOAL_QUOTA['known'] and (GOAL_QUOTA['used']>=GOAL_LOCAL_BUDGET or (GOAL_QUOTA['remaining'] is not None and GOAL_QUOTA['remaining']<=GOAL_DAILY_RESERVE)):
             raise RuntimeError('GOAL API alcanzó el umbral preventivo de consultas diarias; se conserva la cuota restante')
         GOAL_QUOTA['used']+=1
-        url=GOAL_BASE+path
-        if params:url+='?'+urllib.parse.urlencode(params)
-        req=urllib.request.Request(url,headers={'Authorization':'Bearer '+GOAL_TOKEN,'Accept':'application/json','User-Agent':'ParleyStats/1.0'})
-        try:
-            with urllib.request.urlopen(req,timeout=15) as r:
-                data=json.load(r); remaining=r.headers.get('X-RateLimit-Remaining'); reset=r.headers.get('X-RateLimit-Reset')
-                if remaining is not None:GOAL_QUOTA['remaining']=int(remaining); GOAL_QUOTA['known']=True
-                if reset is not None:GOAL_QUOTA['reset']=int(reset); GOAL_QUOTA['date']=datetime.fromtimestamp(int(reset),timezone.utc).date().isoformat()
-            if not data.get('success',True):raise RuntimeError(data.get('message') or 'GOAL API request failed')
+    url=GOAL_BASE+path
+    if params:url+='?'+urllib.parse.urlencode(params)
+    req=urllib.request.Request(url,headers={'Authorization':'Bearer '+GOAL_TOKEN,'Accept':'application/json','User-Agent':'ParleyStats/1.0'})
+    try:
+        with urllib.request.urlopen(req,timeout=15) as r:
+            data=json.load(r); remaining=r.headers.get('X-RateLimit-Remaining'); reset=r.headers.get('X-RateLimit-Reset')
+        if not data.get('success',True):raise RuntimeError(data.get('message') or 'GOAL API request failed')
+        with GOAL_LOCK:
+            if remaining is not None:GOAL_QUOTA['remaining']=int(remaining); GOAL_QUOTA['known']=True
+            if reset is not None:GOAL_QUOTA['reset']=int(reset); GOAL_QUOTA['date']=datetime.fromtimestamp(int(reset),timezone.utc).date().isoformat()
             GOAL_CACHE[key]=(time.time(),data)
-            return data
-        except Exception:
-            # Conservatively retain the request in the local budget: uncertain responses may count.
-            raise
+        return data
+    except Exception:
+        # Conservatively retain the request in the local budget: uncertain responses may count.
+        raise
 
 def goal_prefix(value):return str(value or '').startswith('goal:')
 def goal_raw(value):return str(value or '')[5:] if goal_prefix(value) else str(value or '')
@@ -480,20 +481,20 @@ class Handler(SimpleHTTPRequestHandler):
                 except Exception:
                     pass
                 if not merged:
+                    # Si la consulta global no está disponible, consulta las
+                    # competiciones en paralelo: serialmente podía tardar minutos.
                     try:
                         comps=api('/competitions').get('competitions',[])
-                        for comp in comps:
+                        def fetch_fd_comp(comp):
                             code=comp.get('code') or comp.get('id')
-                            if not code: continue
+                            if not code:return []
                             try:
                                 part=api('/competitions/%s/matches'%code,{'dateFrom':start,'dateTo':query_end,'limit':100})
-                                for m in part.get('matches',[]):
-                                    # Football-Data usa SCHEDULED y TIMED para
-                                    # partidos futuros según la competición.
-                                    if m.get('status') in ('SCHEDULED','TIMED'):
-                                        merged[str(m.get('id'))]=m
-                            except Exception:
-                                continue
+                                return [m for m in part.get('matches',[]) if m.get('status') in ('SCHEDULED','TIMED')]
+                            except Exception:return []
+                        with ThreadPoolExecutor(max_workers=8) as pool:
+                            for future in as_completed([pool.submit(fetch_fd_comp,comp) for comp in comps]):
+                                for m in future.result():merged[str(m.get('id'))]=m
                     except Exception:
                         merged={}
                 local_tz=timezone(timedelta(hours=-5))
@@ -513,16 +514,27 @@ class Handler(SimpleHTTPRequestHandler):
                     fallback=api('/matches',{'dateFrom':start,'dateTo':query_end,'limit':100})
                     data=dict(fallback)
                     data['matches']=[m for m in fallback.get('matches',[]) if m.get('status') in ('SCHEDULED','TIMED') and in_requested_local_range(m)]
-                try:
-                    for league_id in GOAL_LEAGUES:
+                # GOAL tiene muchas ligas habilitadas. Consultarlas una a una
+                # bloqueaba la respuesta y una sola falla abortaba las restantes.
+                # La caché por competición, pool acotado y errores aislados hacen
+                # la primera carga rápida y protegen la cuota diaria.
+                def fetch_goal_upcoming(league_id):
+                    try:
                         gd=goal_api('/leagues/'+league_id+'/fixtures',{'limit':100,'offset':0}).get('data',[])
+                        found=[]
                         for gm in gd:
                             if str(gm.get('leagueId'))!=league_id:continue
                             normalized=goal_normalize_match(gm)
                             if normalized['status'] not in ('SCHEDULED','TIMED','LIVE','IN_PLAY','PAUSED'):continue
                             local=colombia_local_date(normalized.get('utcDate'))
-                            if local and start<=local<=end:merged['goal:'+str(gm.get('id'))]=normalized
-                except Exception:pass
+                            if local and start<=local<=end:found.append(('goal:'+str(gm.get('id')),normalized))
+                        return found
+                    except Exception:
+                        return []
+                with ThreadPoolExecutor(max_workers=16) as pool:
+                    futures=[pool.submit(fetch_goal_upcoming,league_id) for league_id in GOAL_LEAGUES]
+                    for future in as_completed(futures):
+                        for match_id,normalized in future.result():merged[match_id]=normalized
                 data={'matches':list(merged.values()),'resultSet':{'count':len(merged)},'dateFrom':start,'dateTo':end,'scope':'Ligas disponibles · Football-Data.org y GOAL API'}
                 self.send_json(data); return
             if p.path=='/api/today':
