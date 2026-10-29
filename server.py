@@ -15,6 +15,7 @@ GOAL_LEAGUES={
     'cmr77dvv600aprx06o7y7lnfu':{'apiId':'120','name':'Liga BetPlay','country':'Colombia'},
     'cmr77dvtc0093rx0667jirsnv':{'apiId':'44','name':'Liga Profesional Argentina','country':'Argentina'},
     'cmr77dvsv008srx06mier6t7r':{'apiId':'235','name':'Liga MX','country':'Mexico'},
+    'cmr77dvtx009krx06tw1t8obh':{'apiId':'332','name':'MLS','country':'Estados Unidos'},
 }
 GOAL_LEAGUE_ID='cmr77dvv600aprx06o7y7lnfu'
 GOAL_LEAGUE_API_ID='120'
