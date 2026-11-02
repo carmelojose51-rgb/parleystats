@@ -434,7 +434,7 @@ class Handler(SimpleHTTPRequestHandler):
             if p.path.startswith('/api/') and not self.rate_allowed(p.path):
                 self.send_json({'error':'Límite temporal de consultas alcanzado. Intenta nuevamente en un minuto.'},429); return
             if p.path=='/api/competitions':
-                data=api('/competitions'); comps=data.get('competitions',[]); comps.extend(goal_competitions()['competitions']); data['competitions']=comps; self.send_json(data); return
+                data=api('/competitions'); comps=list(data.get('competitions',[])); comps.extend(goal_competitions()['competitions']); by_id={c.get('id'):c for c in comps if c.get('id')}; hidden={'goal:cmr77dvtd009erx06h8rn5zru','goal:cmr77dvtd009hrx06bys03xaz','goal:cmr77dvxw00earx06esy4oem6','goal:cmr77dvvi00axrx06sjsji50a'}; data['competitions']=[c for cid,c in by_id.items() if cid not in hidden]; self.send_json(data); return
             if p.path=='/api/goal-quota':
                 self.send_json({'source':'GOAL API','limit':1000,'remaining':GOAL_QUOTA.get('remaining'),'appRequests':GOAL_QUOTA.get('used',0),'reserve':GOAL_DAILY_RESERVE,'enabled':bool(GOAL_TOKEN),'quotaKnown':GOAL_QUOTA.get('known',False),'resetsAt':GOAL_QUOTA.get('reset')}); return
             if p.path=='/api/teams':
