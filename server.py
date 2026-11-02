@@ -163,6 +163,7 @@ GOAL_LEAGUES={
     'cmr77dx3200q6rx06fcpcukwd':{'apiId':'229','name':'Second League','country':'North Macedonia'},
     'cmr77dvua00a8rx06s1sytscc':{'apiId':'273','name':'Second League B','country':'Russia'},
 }
+BETSSON_HIDDEN_GOAL_IDS={'cmr77dvtd009erx06h8rn5zru','cmr77dvtd009hrx06bys03xaz','cmr77dvxw00earx06esy4oem6','cmr77dvvi00axrx06sjsji50a'}
 GOAL_LEAGUE_ID='cmr77dvv600aprx06o7y7lnfu'
 GOAL_LEAGUE_API_ID='120'
 GOAL_LEAGUE_LABEL='Liga BetPlay (GOAL API)'
@@ -434,14 +435,14 @@ class Handler(SimpleHTTPRequestHandler):
             if p.path.startswith('/api/') and not self.rate_allowed(p.path):
                 self.send_json({'error':'Límite temporal de consultas alcanzado. Intenta nuevamente en un minuto.'},429); return
             if p.path=='/api/competitions':
-                data=api('/competitions'); comps=list(data.get('competitions',[])); comps.extend(goal_competitions()['competitions']); by_id={c.get('id'):c for c in comps if c.get('id')}; hidden={'goal:cmr77dvtd009erx06h8rn5zru','goal:cmr77dvtd009hrx06bys03xaz','goal:cmr77dvxw00earx06esy4oem6','goal:cmr77dvvi00axrx06sjsji50a'}; data['competitions']=[c for cid,c in by_id.items() if cid not in hidden]; self.send_json(data); return
+                data=api('/competitions'); comps=list(data.get('competitions',[])); comps.extend(goal_competitions()['competitions']); by_id={c.get('id'):c for c in comps if c.get('id')}; hidden={'goal:'+x for x in BETSSON_HIDDEN_GOAL_IDS}; data['competitions']=[c for cid,c in by_id.items() if cid not in hidden]; self.send_json(data); return
             if p.path=='/api/goal-quota':
                 self.send_json({'source':'GOAL API','limit':1000,'remaining':GOAL_QUOTA.get('remaining'),'appRequests':GOAL_QUOTA.get('used',0),'reserve':GOAL_DAILY_RESERVE,'enabled':bool(GOAL_TOKEN),'quotaKnown':GOAL_QUOTA.get('known',False),'resetsAt':GOAL_QUOTA.get('reset')}); return
             if p.path=='/api/teams':
                 competition=q.get('competition',[''])[0]
                 if goal_prefix(competition):
                     league_id=goal_raw(competition)
-                    if league_id not in GOAL_LEAGUES:self.send_json({'error':'Liga GOAL no habilitada.'},400); return
+                    if league_id not in GOAL_LEAGUES or league_id in BETSSON_HIDDEN_GOAL_IDS:self.send_json({'error':'Liga GOAL no habilitada.'},400); return
                     self.send_json(goal_teams(league_id)); return
                 if not competition.isdigit(): self.send_json({'error':'Competición no válida.'},400); return
                 self.send_json(api('/competitions/%s/teams'%competition)); return
@@ -520,7 +521,7 @@ class Handler(SimpleHTTPRequestHandler):
                 # Las páginas van en serie para que la cuota reportada se actualice
                 # antes de solicitar otra y nunca se consuma la reserva preventiva.
                 goal_incomplete=False
-                enabled_goal_ids=set(GOAL_LEAGUES)
+                enabled_goal_ids=set(GOAL_LEAGUES)-BETSSON_HIDDEN_GOAL_IDS
                 utc_days=[(start_date+timedelta(days=i)).isoformat() for i in range(days+1)]
                 def fetch_goal_date(day):
                     found=[]; offset=0; total=None
@@ -588,6 +589,7 @@ class Handler(SimpleHTTPRequestHandler):
                 try:
                     existing={str(m.get('id')) for m in data.get('matches',[])}
                     for league_id in GOAL_LEAGUES:
+                        if league_id in BETSSON_HIDDEN_GOAL_IDS:continue
                         gd=goal_api('/leagues/'+league_id+'/fixtures',{'limit':100,'offset':0}).get('data',[])
                         for gm in gd:
                             if str(gm.get('leagueId'))!=league_id:continue
@@ -604,7 +606,7 @@ class Handler(SimpleHTTPRequestHandler):
                 competition=str(q.get('competition',[''])[0] or '')
                 if goal_prefix(competition):
                     league_id=goal_raw(competition)
-                    if league_id not in GOAL_LEAGUES or not (goal_prefix(raw_home) and goal_prefix(raw_away)):
+                    if league_id not in GOAL_LEAGUES or league_id in BETSSON_HIDDEN_GOAL_IDS or not (goal_prefix(raw_home) and goal_prefix(raw_away)):
                         self.send_json({'fixture':None,'date':target,'source':'GOAL API'}); return
                     fixture=goal_find_fixture(raw_home,raw_away,target,league_id,force=q.get('refresh',['0'])[0]=='1')
                     self.send_json({'fixture':fixture,'date':target,'source':'GOAL API'}); return
@@ -630,7 +632,7 @@ class Handler(SimpleHTTPRequestHandler):
                 raw_home=q.get('home',[''])[0]; raw_away=q.get('away',[''])[0]; target=q.get('date',[None])[0]; competition_id=str(q.get('competition',[''])[0] or '')
                 if goal_prefix(competition_id):
                     league_id=goal_raw(competition_id)
-                    if league_id not in GOAL_LEAGUES or not (goal_prefix(raw_home) and goal_prefix(raw_away)):
+                    if league_id not in GOAL_LEAGUES or league_id in BETSSON_HIDDEN_GOAL_IDS or not (goal_prefix(raw_home) and goal_prefix(raw_away)):
                         self.send_json({'error':'Los equipos no corresponden a la liga seleccionada.'},400); return
                     self.send_json(goal_analysis(raw_home,raw_away,target,league_id)); return
                 home=int(raw_home); away=int(raw_away); home_name=q.get('homeName',[''])[0]; away_name=q.get('awayName',[''])[0]
